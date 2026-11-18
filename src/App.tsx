@@ -31,28 +31,70 @@ import {
   LevelClearSummary,
   LiveHudState,
   SaveData,
+  WeatherMode,
 } from './types/game';
 
 const STORAGE_KEY = 'jungle_quest_3d_save_v3';
 const PREV_STORAGE_KEY = 'jungle_quest_3d_save_v2';
 const LEGACY_STORAGE_KEY = 'jungle_quest_3d_save_v1';
 
+function normalizeLevelTopTimes(
+  bestTimes: Record<number, number> | undefined,
+  topTimes: Record<number, number[]> | undefined
+): Record<number, number[]> {
+  const result: Record<number, number[]> = {};
+  if (topTimes) {
+    for (const [key, list] of Object.entries(topTimes)) {
+      const lvl = Number(key);
+      if (!Number.isFinite(lvl) || !Array.isArray(list)) continue;
+      const cleaned = list
+        .filter((t) => typeof t === 'number' && Number.isFinite(t) && t > 0)
+        .sort((a, b) => a - b)
+        .slice(0, 3);
+      if (cleaned.length > 0) {
+        result[lvl] = cleaned;
+      }
+    }
+  }
+  if (bestTimes) {
+    for (const [key, best] of Object.entries(bestTimes)) {
+      const lvl = Number(key);
+      if (!Number.isFinite(lvl) || typeof best !== 'number' || !Number.isFinite(best) || best <= 0) {
+        continue;
+      }
+      if (!result[lvl] || result[lvl].length === 0) {
+        result[lvl] = [best];
+      }
+    }
+  }
+  return result;
+}
+
 function loadSaveData(): SaveData {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<SaveData>;
+      const levelBestTimes = parsed.levelBestTimes ?? {};
       return {
         coins: typeof parsed.coins === 'number' ? parsed.coins : 30,
-        highestUnlockedLevel: Math.max(1, Math.min(20, parsed.highestUnlockedLevel ?? 1)),
+        highestUnlockedLevel: Math.max(1, Math.min(40, parsed.highestUnlockedLevel ?? 1)),
         levelStars: parsed.levelStars ?? {},
-        levelBestTimes: parsed.levelBestTimes ?? {},
+        levelBestTimes,
+        levelTopTimes: normalizeLevelTopTimes(levelBestTimes, parsed.levelTopTimes),
         unlockedCosmetics: Array.from(
           new Set([...STARTER_UNLOCKED_IDS, ...(parsed.unlockedCosmetics ?? [])])
         ),
         equipped: { ...DEFAULT_EQUIPPED, ...(parsed.equipped ?? {}) },
         autoRun: Boolean(parsed.autoRun),
         muted: Boolean(parsed.muted),
+        weatherMode:
+          parsed.weatherMode === 'auto' ||
+          parsed.weatherMode === 'rain' ||
+          parsed.weatherMode === 'mist' ||
+          parsed.weatherMode === 'clear'
+            ? parsed.weatherMode
+            : 'auto',
         dailyMissions: syncDailyMissionState(parsed.dailyMissions),
       };
     }
@@ -72,17 +114,20 @@ function loadSaveData(): SaveData {
       if (migratedEquipped.color === 'color_olive') {
         migratedEquipped.color = 'color_crimson';
       }
+      const levelBestTimes = parsed.levelBestTimes ?? {};
       return {
         coins: typeof parsed.coins === 'number' ? parsed.coins : 30,
-        highestUnlockedLevel: Math.max(1, Math.min(20, parsed.highestUnlockedLevel ?? 1)),
+        highestUnlockedLevel: Math.max(1, Math.min(40, parsed.highestUnlockedLevel ?? 1)),
         levelStars: parsed.levelStars ?? {},
-        levelBestTimes: parsed.levelBestTimes ?? {},
+        levelBestTimes,
+        levelTopTimes: normalizeLevelTopTimes(levelBestTimes, parsed.levelTopTimes),
         unlockedCosmetics: Array.from(
           new Set([...STARTER_UNLOCKED_IDS, ...(parsed.unlockedCosmetics ?? [])])
         ),
         equipped: migratedEquipped,
         autoRun: Boolean(parsed.autoRun),
         muted: Boolean(parsed.muted),
+        weatherMode: 'auto',
         dailyMissions: syncDailyMissionState(parsed.dailyMissions),
       };
     }
@@ -94,10 +139,12 @@ function loadSaveData(): SaveData {
     highestUnlockedLevel: 1,
     levelStars: {},
     levelBestTimes: {},
+    levelTopTimes: {},
     unlockedCosmetics: [...STARTER_UNLOCKED_IDS],
     equipped: { ...DEFAULT_EQUIPPED },
     autoRun: false,
     muted: false,
+    weatherMode: 'auto',
     dailyMissions: syncDailyMissionState(undefined),
   };
 }
@@ -128,7 +175,7 @@ function advanceDailyMissions(
 export default function App() {
   const [save, setSave] = useState<SaveData>(() => loadSaveData());
   const [currentLevel, setCurrentLevel] = useState<number>(() =>
-    Math.min(20, loadSaveData().highestUnlockedLevel)
+    Math.min(40, loadSaveData().highestUnlockedLevel)
   );
   const [runNonce, setRunNonce] = useState<number>(1);
   const [phase, setPhase] = useState<GamePhase>('menu');
@@ -149,6 +196,7 @@ export default function App() {
     activePowerUp: null,
     powerUpRemaining: 0,
     stompCombo: 0,
+    weather: 'clear',
   });
 
   const touchBridgeRef = useRef<TouchInputBridge>({
@@ -205,7 +253,7 @@ export default function App() {
   }, [returnPhase]);
 
   const startLevel = useCallback((lvl: number) => {
-    const clamped = Math.max(1, Math.min(20, lvl));
+    const clamped = Math.max(1, Math.min(40, lvl));
     const spec = getLevelSpec(clamped);
     setCurrentLevel(clamped);
     setRunNonce((n) => n + 1);
@@ -223,6 +271,7 @@ export default function App() {
       activePowerUp: null,
       powerUpRemaining: 0,
       stompCombo: 0,
+      weather: spec.biome === 'waterfall' ? 'mist' : 'clear',
     });
     setPhase('playing');
   }, []);
@@ -283,6 +332,12 @@ export default function App() {
           ? 2
           : 1;
       const bonusCoins = 12 + currentLevel * 4;
+      const points =
+        currentLevel * 100 +
+        sessionCoins * 25 +
+        bonusCoins * 10 +
+        stars * 250 +
+        livesRemaining * 150;
 
       const newlyUnlocked: CosmeticItem[] = [];
       setSave((prev) => {
@@ -300,12 +355,19 @@ export default function App() {
 
         const prevStars = prev.levelStars[currentLevel] ?? 0;
         const prevBest = prev.levelBestTimes[currentLevel];
+        const prevTop =
+          prev.levelTopTimes[currentLevel] ??
+          (prevBest !== undefined ? [prevBest] : []);
+        const nextTop = [...prevTop, elapsedSeconds]
+          .filter((t) => Number.isFinite(t) && t > 0)
+          .sort((a, b) => a - b)
+          .slice(0, 3);
 
         return {
           ...prev,
           coins: prev.coins + bonusCoins,
           highestUnlockedLevel: Math.min(
-            20,
+            40,
             Math.max(prev.highestUnlockedLevel, currentLevel + 1)
           ),
           levelStars: {
@@ -315,7 +377,12 @@ export default function App() {
           levelBestTimes: {
             ...prev.levelBestTimes,
             [currentLevel]:
-              prevBest === undefined ? elapsedSeconds : Math.min(prevBest, elapsedSeconds),
+              nextTop[0] ??
+              (prevBest === undefined ? elapsedSeconds : Math.min(prevBest, elapsedSeconds)),
+          },
+          levelTopTimes: {
+            ...prev.levelTopTimes,
+            [currentLevel]: nextTop,
           },
           unlockedCosmetics: Array.from(nextUnlocked),
           dailyMissions: advanceDailyMissions(prev, (mSpec, cur) => {
@@ -343,15 +410,24 @@ export default function App() {
         level: currentLevel,
         coinsEarned: sessionCoins,
         bonusCoins,
+        points,
         timeSeconds: elapsedSeconds,
         stars,
         newlyUnlockedItems: newlyUnlocked,
       });
 
-      setPhase(currentLevel === 20 ? 'victory' : 'levelComplete');
+      setPhase('finishing');
     },
     [currentLevel]
   );
+
+  const handleFinishAnimationComplete = useCallback(() => {
+    soundEngine.mysteryBlock();
+    setPhase((prev) => {
+      if (prev !== 'finishing') return prev;
+      return currentLevel === 40 ? 'victory' : 'levelComplete';
+    });
+  }, [currentLevel]);
 
   const handleGameOver = useCallback(() => {
     setPhase('gameOver');
@@ -459,6 +535,16 @@ export default function App() {
   const claimableMissionsCount = countClaimableMissions(dailyMissionState, dailyMissionSpecs);
   const claimableMissionCoins = totalClaimableMissionCoins(dailyMissionState, dailyMissionSpecs);
 
+  const currentWeatherMode: WeatherMode = save.weatherMode ?? 'auto';
+  const handleCycleWeatherMode = useCallback(() => {
+    const weatherOrder: WeatherMode[] = ['auto', 'rain', 'mist', 'clear'];
+    const next = weatherOrder[(weatherOrder.indexOf(currentWeatherMode) + 1) % weatherOrder.length];
+    setSave((prev) => ({ ...prev, weatherMode: next }));
+    if (next !== 'auto') {
+      setHud((h) => ({ ...h, weather: next }));
+    }
+  }, [currentWeatherMode]);
+
   return (
     <div className="relative h-dvh w-screen overflow-hidden bg-[#081a14]">
       {/* Full-Bleed 3D WebGL + Cannon-ES Physics Jungle Canvas */}
@@ -468,12 +554,14 @@ export default function App() {
         phase={phase}
         customization={save.equipped}
         autoRun={save.autoRun}
+        weatherMode={currentWeatherMode}
         touchBridgeRef={touchBridgeRef}
         onHudUpdate={setHud}
         onSessionCoinsChange={handleSessionCoinsChange}
         onBoxHit={handleBoxHit}
         onEnemyDefeated={handleEnemyDefeated}
         onLevelCleared={handleLevelCleared}
+        onFinishAnimationComplete={handleFinishAnimationComplete}
         onGameOver={handleGameOver}
       />
 
@@ -484,11 +572,13 @@ export default function App() {
         phase={phase}
         autoRun={save.autoRun}
         muted={save.muted}
+        weatherMode={currentWeatherMode}
         claimableMissionsCount={claimableMissionsCount}
         touchBridgeRef={touchBridgeRef}
         onToggleAutoRun={() =>
           setSave((prev) => ({ ...prev, autoRun: !prev.autoRun }))
         }
+        onCycleWeatherMode={handleCycleWeatherMode}
         onToggleMute={() =>
           setSave((prev) => {
             const nextMuted = !prev.muted;
@@ -537,12 +627,13 @@ export default function App() {
         />
       )}
 
-      {/* 20-Level Expedition Map */}
+      {/* 40-Level Expedition Map */}
       {phase === 'levels' && (
         <LevelSelectModal
           currentLevel={currentLevel}
           highestUnlocked={save.highestUnlockedLevel}
           levelStars={save.levelStars}
+          levelTopTimes={save.levelTopTimes}
           onSelectLevel={(lvl) => startLevel(lvl)}
           onClose={closeModal}
         />

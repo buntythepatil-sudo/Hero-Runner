@@ -13,6 +13,7 @@ export type BiomeType = 'canopy' | 'ruins' | 'waterfall' | 'volcano';
 export type GamePhase =
   | 'menu'
   | 'playing'
+  | 'finishing'
   | 'paused'
   | 'levelComplete'
   | 'gameOver'
@@ -22,6 +23,9 @@ export type GamePhase =
   | 'missions';
 
 export type PowerUpType = 'shield' | 'magnet' | 'speed' | 'blaster';
+
+export type WeatherKind = 'clear' | 'mist' | 'rain';
+export type WeatherMode = 'auto' | WeatherKind;
 
 export type DailyMissionKind =
   | 'collect_coins'
@@ -82,10 +86,12 @@ export interface SaveData {
   highestUnlockedLevel: number;
   levelStars: Record<number, number>;
   levelBestTimes: Record<number, number>;
+  levelTopTimes: Record<number, number[]>;
   unlockedCosmetics: string[];
   equipped: CharacterCustomization;
   autoRun: boolean;
   muted: boolean;
+  weatherMode?: WeatherMode;
   dailyMissions?: DailyMissionState;
 }
 
@@ -171,10 +177,12 @@ export interface LiveHudState {
   activePowerUp: PowerUpType | null;
   powerUpRemaining: number;
   stompCombo: number;
+  weather: WeatherKind;
 }
 
 export interface LevelClearSummary {
   level: number;
+  points: number;
   coinsEarned: number;
   bonusCoins: number;
   timeSeconds: number;

@@ -2,6 +2,7 @@ import React from 'react';
 import { Coins, ListChecks, Map, Play, RotateCcw, Shirt, Star, Trophy } from 'lucide-react';
 import { getLevelSpec } from '../data/levels';
 import { GamePhase, LevelClearSummary } from '../types/game';
+import { ConfettiBurst } from './ConfettiBurst';
 
 interface GameOverlaysProps {
   phase: GamePhase;
@@ -36,25 +37,38 @@ export const GameOverlays: React.FC<GameOverlaysProps> = ({
   onOpenMissions,
   onClaimAllMissions,
 }) => {
-  if (phase === 'playing' || phase === 'wardrobe' || phase === 'levels' || phase === 'missions') {
+  if (
+    phase === 'playing' ||
+    phase === 'finishing' ||
+    phase === 'wardrobe' ||
+    phase === 'levels' ||
+    phase === 'missions'
+  ) {
     return null;
   }
 
   const levelSpec = getLevelSpec(currentLevel);
+  const isThreeStarClear =
+    (phase === 'levelComplete' || phase === 'victory') && summary?.stars === 3;
 
   return (
-    <div
-      className="absolute inset-0 z-30 flex items-end sm:items-center justify-center p-4 pb-6"
-      style={{ backgroundColor: 'rgba(8, 17, 13, 0.72)' }}
-    >
+    <>
+      <ConfettiBurst
+        active={isThreeStarClear}
+        triggerKey={summary ? `${summary.level}-${summary.timeSeconds}` : 'none'}
+      />
       <div
-        className="w-full max-w-md rounded-2xl border border-white/15 p-5 shadow-2xl"
-        style={{ backgroundColor: '#10221b' }}
+        className="absolute inset-0 z-30 flex items-end sm:items-center justify-center p-4 pb-6"
+        style={{ backgroundColor: 'rgba(8, 17, 13, 0.72)' }}
       >
+        <div
+          className="w-full max-w-md rounded-2xl border border-white/15 p-5 shadow-2xl"
+          style={{ backgroundColor: '#10221b' }}
+        >
         {phase === 'menu' && (
           <div>
             <div className="text-[11px] font-semibold text-amber-400">
-              Portrait 3D Rear-View Platformer · 20 Levels
+              Portrait 3D Rear-View Platformer · 40 Levels
             </div>
             <h1 className="mt-1 font-display text-3xl font-extrabold tracking-tight text-stone-50">
               Jungle Quest 3D
@@ -69,7 +83,7 @@ export const GameOverlays: React.FC<GameOverlaysProps> = ({
               <div>
                 <div className="text-stone-400">Unlocked Stage</div>
                 <div className="mt-0.5 font-mono-tabular font-bold text-stone-100">
-                  Level {highestUnlockedLevel} / 20
+                  Level {highestUnlockedLevel} / 40
                 </div>
               </div>
               <div>
@@ -105,7 +119,7 @@ export const GameOverlays: React.FC<GameOverlaysProps> = ({
                   className="flex items-center justify-center gap-1.5 rounded-xl border border-white/15 bg-white/8 px-3 py-3 text-xs font-bold text-stone-100 active:bg-white/14"
                 >
                   <Map className="h-4 w-4 text-emerald-300" />
-                  <span>20 Levels</span>
+                  <span>40 Levels</span>
                 </button>
               </div>
               <button
@@ -140,7 +154,7 @@ export const GameOverlays: React.FC<GameOverlaysProps> = ({
         {phase === 'paused' && (
           <div>
             <div className="text-xs font-semibold text-stone-400">
-              Level {currentLevel} / 20 · {levelSpec.name}
+              Level {currentLevel} / 40 · {levelSpec.name}
             </div>
             <h2 className="mt-1 font-display text-2xl font-bold text-stone-50">
               Paused
@@ -207,9 +221,20 @@ export const GameOverlays: React.FC<GameOverlaysProps> = ({
               <span className="ml-2 font-mono-tabular text-xs text-stone-300">
                 {summary.timeSeconds.toFixed(1)}s
               </span>
+              {summary.stars === 3 && (
+                <span className="ml-auto text-xs font-bold text-amber-300">
+                  3-Star Clear
+                </span>
+              )}
             </div>
 
-            <div className="mt-3 grid grid-cols-2 gap-2.5 rounded-xl border border-white/10 bg-black/25 p-3 text-xs">
+            <div className="mt-3 grid grid-cols-3 gap-2 rounded-xl border border-white/10 bg-black/25 p-3 text-xs">
+              <div>
+                <div className="text-stone-400">Points</div>
+                <div className="mt-0.5 font-mono-tabular font-bold text-stone-100">
+                  {summary.points.toLocaleString()}
+                </div>
+              </div>
               <div>
                 <div className="text-stone-400">Course Coins</div>
                 <div className="mt-0.5 font-mono-tabular font-bold text-amber-300">
@@ -258,11 +283,11 @@ export const GameOverlays: React.FC<GameOverlaysProps> = ({
             <div className="mt-5 flex flex-col gap-2.5">
               <button
                 type="button"
-                onClick={() => onStartLevel(Math.min(20, summary.level + 1))}
+                onClick={() => onStartLevel(Math.min(40, summary.level + 1))}
                 className="flex w-full items-center justify-center gap-2 rounded-xl bg-amber-400 px-5 py-3.5 font-display text-base font-extrabold text-stone-950"
               >
                 <Play className="h-4 w-4 fill-current" />
-                <span>Next: Level {Math.min(20, summary.level + 1)}</span>
+                <span>Next: Level {Math.min(40, summary.level + 1)}</span>
               </button>
               <button
                 type="button"
@@ -330,13 +355,57 @@ export const GameOverlays: React.FC<GameOverlaysProps> = ({
           <div>
             <div className="flex items-center gap-1.5 text-xs font-bold text-amber-400">
               <Trophy className="h-4 w-4" />
-              <span>All 20 Levels Conquered</span>
+              <span>All 40 Levels Conquered</span>
             </div>
             <h2 className="mt-1 font-display text-2xl font-extrabold text-stone-50">
               Temple Summit Champion
             </h2>
+            {summary && (
+              <>
+                <div className="mt-2.5 flex items-center gap-1.5">
+                  {[1, 2, 3].map((s) => (
+                    <Star
+                      key={s}
+                      className={`h-5 w-5 ${
+                        s <= summary.stars
+                          ? 'fill-amber-400 text-amber-400'
+                          : 'text-stone-600'
+                      }`}
+                    />
+                  ))}
+                  <span className="ml-2 font-mono-tabular text-xs text-stone-300">
+                    {summary.timeSeconds.toFixed(1)}s
+                  </span>
+                  {summary.stars === 3 && (
+                    <span className="ml-auto text-xs font-bold text-amber-300">
+                      3-Star Clear
+                    </span>
+                  )}
+                </div>
+                <div className="mt-3 grid grid-cols-3 gap-2 rounded-xl border border-white/10 bg-black/25 p-3 text-xs">
+                  <div>
+                    <div className="text-stone-400">Points</div>
+                    <div className="mt-0.5 font-mono-tabular font-bold text-stone-100">
+                      {summary.points.toLocaleString()}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-stone-400">Course Coins</div>
+                    <div className="mt-0.5 font-mono-tabular font-bold text-amber-300">
+                      +{summary.coinsEarned}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-stone-400">Clear Bonus</div>
+                    <div className="mt-0.5 font-mono-tabular font-bold text-emerald-300">
+                      +{summary.bonusCoins}
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
             <p className="mt-1.5 text-xs leading-relaxed text-stone-300">
-              You conquered every biome through Level 20! Replay any level for 3
+              You conquered every biome through Level 40! Replay any level for 3
               stars or unlock every cosmetic in the Wardrobe.
             </p>
             <div className="mt-5 flex flex-col gap-2.5">
@@ -369,5 +438,6 @@ export const GameOverlays: React.FC<GameOverlaysProps> = ({
         )}
       </div>
     </div>
+    </>
   );
 };

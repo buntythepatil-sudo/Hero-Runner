@@ -44,22 +44,22 @@ const SPEED_MISSIONS: Omit<DailyMissionSpec, 'id'>[] = [
   {
     kind: 'speed_clear',
     title: 'Quick Draw Dash',
-    description: 'Finish any level in under 35 seconds.',
-    target: 35,
+    description: 'Finish any level in under 45 seconds.',
+    target: 45,
     rewardCoins: 25,
   },
   {
     kind: 'speed_clear',
     title: 'Lightning Trailblazer',
-    description: 'Finish any level in under 28 seconds.',
-    target: 28,
+    description: 'Finish any level in under 38 seconds.',
+    target: 38,
     rewardCoins: 35,
   },
   {
     kind: 'speed_clear',
     title: 'Canyon Sprint',
-    description: 'Finish any level in under 24 seconds.',
-    target: 24,
+    description: 'Finish any level in under 32 seconds.',
+    target: 32,
     rewardCoins: 45,
   },
 ];

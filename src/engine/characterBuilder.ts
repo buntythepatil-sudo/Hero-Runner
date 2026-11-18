@@ -20,6 +20,13 @@ export interface CharacterRig {
   wingLeft?: THREE.Mesh;
   wingRight?: THREE.Mesh;
   shieldOrb: THREE.Mesh;
+  animState: {
+    runPhase: number;
+    runBlend: number;
+    airBlend: number;
+    turnYaw: number;
+    lastTime: number;
+  };
   dispose: () => void;
 }
 
@@ -1614,6 +1621,13 @@ export function buildCharacterRig(custom: CharacterCustomization): CharacterRig 
     wingLeft,
     wingRight,
     shieldOrb,
+    animState: {
+      runPhase: 0,
+      runBlend: 0,
+      airBlend: 0,
+      turnYaw: 0,
+      lastTime: -1,
+    },
     dispose: () => {
       createdTextures.forEach((tex) => tex.dispose());
       root.traverse((obj) => {
@@ -1639,24 +1653,32 @@ export function animateCharacterRig(
   time: number,
   strafeVelX: number,
   isWardrobeIdle = false,
-  hasBlaster = false
+  hasBlaster = false,
+  flipProgress = 0
 ) {
   rig.blasterGroup.visible = hasBlaster;
+  const st = rig.animState;
+  const dt = st.lastTime < 0 ? 0.016 : THREE.MathUtils.clamp(time - st.lastTime, 0, 0.05);
+  st.lastTime = time;
 
   if (isWardrobeIdle) {
+    st.runBlend = 0;
+    st.airBlend = 0;
+    st.turnYaw = 0;
+    rig.root.rotation.y = 0;
     rig.bodyPivot.position.y = Math.sin(time * 2.2) * 0.025;
     rig.bodyPivot.rotation.set(0, 0, 0);
-    rig.leftArmPivot.rotation.x = Math.sin(time * 2.2) * 0.06;
-    rig.rightArmPivot.rotation.x = -Math.sin(time * 2.2) * 0.06;
-    rig.leftArmPivot.rotation.z = -0.06;
-    rig.rightArmPivot.rotation.z = 0.06;
+    rig.headGroup.rotation.set(0, 0, 0);
+    rig.leftArmPivot.rotation.set(Math.sin(time * 2.2) * 0.06, 0, -0.06);
+    rig.rightArmPivot.rotation.set(-Math.sin(time * 2.2) * 0.06, 0, 0.06);
     rig.leftElbowPivot.rotation.x = 0.25;
     rig.rightElbowPivot.rotation.x = 0.25;
     rig.leftLegPivot.rotation.x = 0;
     rig.rightLegPivot.rotation.x = 0;
     rig.leftKneePivot.rotation.x = 0;
     rig.rightKneePivot.rotation.x = 0;
-    rig.scarfTail.rotation.x = 0.2 + Math.sin(time * 3) * 0.06;
+    rig.scarfTail.rotation.x = -0.18 - Math.sin(time * 3) * 0.05;
+    rig.scarfTail.rotation.z = 0;
     if (rig.wingLeft && rig.wingRight) {
       const flap = Math.sin(time * 3.5) * 0.14;
       rig.wingLeft.rotation.y = 0.25 + flap;
@@ -1665,80 +1687,139 @@ export function animateCharacterRig(
     return;
   }
 
-  const normalizedRun = Math.min(1, speedHoriz / 10.0);
-  const stridePhase = time * (7.2 + normalizedRun * 12.2);
+  // Smoothly integrate gait phase proportional to real velocity (zero phase snapping)
+  const targetRun =
+    grounded && speedHoriz > 0.35
+      ? THREE.MathUtils.clamp(speedHoriz / 10.5, 0.18, 1.0)
+      : 0;
+  st.runBlend = THREE.MathUtils.damp(st.runBlend, targetRun, 14, dt);
+  st.airBlend = THREE.MathUtils.damp(st.airBlend, grounded ? 0 : 1, 16, dt);
 
-  // Subtle neckerchief wind flutter
-  rig.scarfTail.rotation.x = 0.18 + normalizedRun * 0.42 + Math.sin(time * 16) * 0.12;
-  rig.scarfTail.rotation.z = Math.cos(time * 12) * 0.10;
-
-  // Natural athletic shoulder splay so arms clear hips
-  rig.leftArmPivot.rotation.z = -0.08;
-  rig.rightArmPivot.rotation.z = 0.08;
-
-  if (grounded) {
-    if (speedHoriz > 0.4) {
-      // Athletic forward-leaning Temple Run sprint with pumping elbows & bending knees!
-      const swing = Math.sin(stridePhase) * (0.34 + normalizedRun * 0.72);
-      rig.leftLegPivot.rotation.x = swing;
-      rig.rightLegPivot.rotation.x = -swing;
-      rig.leftKneePivot.rotation.x = Math.max(0, -Math.cos(stridePhase)) * 0.98 * normalizedRun;
-      rig.rightKneePivot.rotation.x = Math.max(0, Math.cos(stridePhase)) * 0.98 * normalizedRun;
-
-      rig.leftArmPivot.rotation.x = -swing * 0.95;
-      rig.leftElbowPivot.rotation.x = 1.08;
-
-      if (hasBlaster) {
-        rig.rightArmPivot.rotation.x = 0.48;
-        rig.rightElbowPivot.rotation.x = 0.72;
-      } else {
-        rig.rightArmPivot.rotation.x = swing * 0.95;
-        rig.rightElbowPivot.rotation.x = 1.08;
-      }
-
-      rig.bodyPivot.position.y = Math.abs(Math.cos(stridePhase)) * 0.055 * normalizedRun;
-      rig.bodyPivot.rotation.x = -0.12 - normalizedRun * 0.15;
-    } else {
-      const breathe = Math.sin(time * 2.6);
-      rig.leftLegPivot.rotation.x = THREE.MathUtils.lerp(rig.leftLegPivot.rotation.x, 0, 0.2);
-      rig.rightLegPivot.rotation.x = THREE.MathUtils.lerp(rig.rightLegPivot.rotation.x, 0, 0.2);
-      rig.leftKneePivot.rotation.x = THREE.MathUtils.lerp(rig.leftKneePivot.rotation.x, 0, 0.2);
-      rig.rightKneePivot.rotation.x = THREE.MathUtils.lerp(rig.rightKneePivot.rotation.x, 0, 0.2);
-      rig.leftArmPivot.rotation.x = breathe * 0.05;
-      rig.leftElbowPivot.rotation.x = 0.28;
-      if (hasBlaster) {
-        rig.rightArmPivot.rotation.x = 0.42;
-        rig.rightElbowPivot.rotation.x = 0.75;
-      } else {
-        rig.rightArmPivot.rotation.x = -breathe * 0.05;
-        rig.rightElbowPivot.rotation.x = 0.28;
-      }
-      rig.bodyPivot.position.y = breathe * 0.02;
-      rig.bodyPivot.rotation.x = THREE.MathUtils.lerp(rig.bodyPivot.rotation.x, 0, 0.2);
-    }
-  } else {
-    // Airborne athletic Temple Run leap pose (matching reference leap silhouette)
-    const jumpPose = THREE.MathUtils.clamp(velY * 0.06, -0.5, 0.7);
-    rig.leftLegPivot.rotation.x = 0.55 + jumpPose * 0.35;
-    rig.rightLegPivot.rotation.x = -0.55 - jumpPose * 0.25;
-    rig.leftKneePivot.rotation.x = 0.78;
-    rig.rightKneePivot.rotation.x = 0.48;
-    rig.leftArmPivot.rotation.x = -0.95 - jumpPose * 0.4;
-    rig.leftElbowPivot.rotation.x = 0.72;
-    rig.leftArmPivot.rotation.z = -0.32;
-    if (hasBlaster) {
-      rig.rightArmPivot.rotation.x = 0.52;
-      rig.rightElbowPivot.rotation.x = 0.7;
-    } else {
-      rig.rightArmPivot.rotation.x = -0.75 - jumpPose * 0.4;
-      rig.rightElbowPivot.rotation.x = 0.72;
-      rig.rightArmPivot.rotation.z = 0.32;
-    }
-    rig.bodyPivot.rotation.x = -0.15;
+  if (speedHoriz > 0.35 && grounded) {
+    const strideFreq = 5.4 + speedHoriz * 0.88;
+    st.runPhase = (st.runPhase + dt * strideFreq) % (Math.PI * 2);
   }
 
-  const targetBank = THREE.MathUtils.clamp(-strafeVelX * 0.04, -0.25, 0.25);
-  rig.bodyPivot.rotation.z = THREE.MathUtils.lerp(rig.bodyPivot.rotation.z, targetBank, 0.18);
+  const runB = st.runBlend;
+  const airB = st.airBlend;
+  const pL = st.runPhase;
+  const pR = pL + Math.PI;
+
+  // Natural neckerchief streaming backward (+Z) in slipstream
+  const airSpeedFactor = Math.max(runB, airB * 0.65);
+  rig.scarfTail.rotation.x = -0.16 - airSpeedFactor * 0.56 - Math.sin(time * 16) * 0.11;
+  rig.scarfTail.rotation.z = Math.cos(time * 11) * (0.04 + airSpeedFactor * 0.08);
+
+  // Idle pose (grounded, stationary)
+  const breathe = Math.sin(time * 2.6);
+  const idleBodyY = breathe * 0.018;
+  const idleLeftArmX = breathe * 0.05;
+  const idleRightArmX = -breathe * 0.05;
+
+  // Biomechanical human sprint cycle (hips + backward-bending knees + torso twist)
+  const evalKnee = (p: number) => {
+    const swingBell = Math.pow(Math.max(0, -Math.sin(p - 0.22)), 1.35);
+    const stanceFlex = Math.pow(Math.max(0, Math.sin(p + 0.35)), 1.2) * 0.28;
+    return -(0.10 + swingBell * 1.34 + stanceFlex);
+  };
+  const evalHip = (p: number) =>
+    (0.64 * Math.cos(p) - 0.06 * Math.sin(p)) * (0.52 + 0.48 * runB);
+
+  const runLeftHip = evalHip(pL);
+  const runRightHip = evalHip(pR);
+  const runLeftKnee = evalKnee(pL);
+  const runRightKnee = evalKnee(pR);
+
+  const lArmSwing = -Math.cos(pL);
+  const rArmSwing = -Math.cos(pR);
+  const armAmp = 0.50 + 0.36 * runB;
+  const runLeftArmX = lArmSwing * armAmp - 0.04;
+  const runRightArmX = rArmSwing * armAmp - 0.04;
+  const runLeftElbowX = 0.92 + Math.max(0, lArmSwing) * 0.56;
+  const runRightElbowX = 0.92 + Math.max(0, rArmSwing) * 0.56;
+  const runLeftArmZ = -0.11 - Math.max(0, -lArmSwing) * 0.05;
+  const runRightArmZ = 0.11 + Math.max(0, -rArmSwing) * 0.05;
+  const runLeftArmY = Math.max(0, lArmSwing) * 0.22;
+  const runRightArmY = -Math.max(0, rArmSwing) * 0.22;
+
+  const runBodyY = -Math.cos(2 * pL - 0.55) * 0.048 + 0.008;
+  const runBodyRotX = -0.09 - 0.15 * runB + Math.cos(2 * pL) * 0.022;
+  const runBodyRotY = -Math.cos(pL) * 0.09;
+  const runHeadRotX = 0.07 + 0.13 * runB;
+  const runHeadRotY = Math.cos(pL) * 0.06;
+
+  // Blend Idle <-> Run for grounded state
+  const gLeftHip = THREE.MathUtils.lerp(0, runLeftHip, runB);
+  const gRightHip = THREE.MathUtils.lerp(0, runRightHip, runB);
+  const gLeftKnee = THREE.MathUtils.lerp(-0.04, runLeftKnee, runB);
+  const gRightKnee = THREE.MathUtils.lerp(-0.04, runRightKnee, runB);
+
+  const gLeftArmX = THREE.MathUtils.lerp(idleLeftArmX, runLeftArmX, runB);
+  const gRightArmX = THREE.MathUtils.lerp(idleRightArmX, runRightArmX, runB);
+  const gLeftElbowX = THREE.MathUtils.lerp(0.28, runLeftElbowX, runB);
+  const gRightElbowX = THREE.MathUtils.lerp(0.28, runRightElbowX, runB);
+  const gLeftArmZ = THREE.MathUtils.lerp(-0.08, runLeftArmZ, runB);
+  const gRightArmZ = THREE.MathUtils.lerp(0.08, runRightArmZ, runB);
+  const gLeftArmY = THREE.MathUtils.lerp(0, runLeftArmY, runB);
+  const gRightArmY = THREE.MathUtils.lerp(0, runRightArmY, runB);
+
+  const gBodyY = THREE.MathUtils.lerp(idleBodyY, runBodyY, runB);
+  const gBodyRotX = THREE.MathUtils.lerp(0, runBodyRotX, runB);
+  const gBodyRotY = THREE.MathUtils.lerp(0, runBodyRotY, runB);
+  const gHeadRotX = THREE.MathUtils.lerp(0, runHeadRotX, runB);
+  const gHeadRotY = THREE.MathUtils.lerp(0, runHeadRotY, runB);
+
+  // Airborne leap pose + tucked double-jump somersault (knees bend backward < 0!)
+  const jumpPose = THREE.MathUtils.clamp(velY * 0.055, -0.45, 0.65);
+  const tuck = flipProgress > 0 && flipProgress < 1 ? Math.sin(flipProgress * Math.PI) : 0;
+
+  const aLeftHip = THREE.MathUtils.lerp(0.56 + jumpPose * 0.28, 1.25, tuck);
+  const aRightHip = THREE.MathUtils.lerp(-0.46 - jumpPose * 0.22, 1.15, tuck);
+  const aLeftKnee = THREE.MathUtils.lerp(-0.82, -1.78, tuck);
+  const aRightKnee = THREE.MathUtils.lerp(-0.56, -1.78, tuck);
+  const aLeftArmX = THREE.MathUtils.lerp(0.75 + jumpPose * 0.35, 0.95, tuck);
+  const aRightArmX = THREE.MathUtils.lerp(-0.55 - jumpPose * 0.25, 0.95, tuck);
+  const aLeftElbowX = THREE.MathUtils.lerp(0.72, 1.45, tuck);
+  const aRightElbowX = THREE.MathUtils.lerp(0.72, 1.45, tuck);
+  const aLeftArmZ = THREE.MathUtils.lerp(-0.30, -0.14, tuck);
+  const aRightArmZ = THREE.MathUtils.lerp(0.30, 0.14, tuck);
+  const aBodyRotX = THREE.MathUtils.lerp(-0.14, -0.32, tuck);
+
+  // Blend Grounded <-> Airborne smoothly
+  rig.leftLegPivot.rotation.x = THREE.MathUtils.lerp(gLeftHip, aLeftHip, airB);
+  rig.rightLegPivot.rotation.x = THREE.MathUtils.lerp(gRightHip, aRightHip, airB);
+  rig.leftKneePivot.rotation.x = THREE.MathUtils.lerp(gLeftKnee, aLeftKnee, airB);
+  rig.rightKneePivot.rotation.x = THREE.MathUtils.lerp(gRightKnee, aRightKnee, airB);
+
+  rig.leftArmPivot.rotation.x = THREE.MathUtils.lerp(gLeftArmX, aLeftArmX, airB);
+  rig.leftElbowPivot.rotation.x = THREE.MathUtils.lerp(gLeftElbowX, aLeftElbowX, airB);
+  rig.leftArmPivot.rotation.z = THREE.MathUtils.lerp(gLeftArmZ, aLeftArmZ, airB);
+  rig.leftArmPivot.rotation.y = THREE.MathUtils.lerp(gLeftArmY, 0, airB);
+
+  if (hasBlaster) {
+    rig.rightArmPivot.rotation.set(0.48, 0, 0.08);
+    rig.rightElbowPivot.rotation.x = 0.72;
+  } else {
+    rig.rightArmPivot.rotation.x = THREE.MathUtils.lerp(gRightArmX, aRightArmX, airB);
+    rig.rightElbowPivot.rotation.x = THREE.MathUtils.lerp(gRightElbowX, aRightElbowX, airB);
+    rig.rightArmPivot.rotation.z = THREE.MathUtils.lerp(gRightArmZ, aRightArmZ, airB);
+    rig.rightArmPivot.rotation.y = THREE.MathUtils.lerp(gRightArmY, 0, airB);
+  }
+
+  rig.bodyPivot.position.y = THREE.MathUtils.lerp(gBodyY, 0.02, airB);
+  rig.bodyPivot.rotation.x = THREE.MathUtils.lerp(gBodyRotX, aBodyRotX, airB);
+  rig.bodyPivot.rotation.y = THREE.MathUtils.lerp(gBodyRotY, 0, airB);
+
+  rig.headGroup.rotation.x = THREE.MathUtils.lerp(gHeadRotX, 0.12, airB);
+  rig.headGroup.rotation.y = THREE.MathUtils.lerp(gHeadRotY, 0, airB);
+
+  // Natural lean & turn yaw into horizontal steering
+  const targetBank = THREE.MathUtils.clamp(-strafeVelX * 0.036, -0.22, 0.22);
+  rig.bodyPivot.rotation.z = THREE.MathUtils.damp(rig.bodyPivot.rotation.z, targetBank, 12, dt);
+
+  const targetTurn = THREE.MathUtils.clamp(-strafeVelX * 0.042, -0.28, 0.28);
+  st.turnYaw = THREE.MathUtils.damp(st.turnYaw, targetTurn, 12, dt);
+  rig.root.rotation.y = st.turnYaw;
 
   if (rig.wingLeft && rig.wingRight) {
     const flapSpeed = grounded ? 4 : 11;
@@ -1748,3 +1829,72 @@ export function animateCharacterRig(
     rig.wingRight.rotation.y = -0.25 - flap;
   }
 }
+
+export function animateCharacterCelebrate(
+  rig: CharacterRig,
+  finishElapsed: number,
+  time: number
+): number {
+  rig.blasterGroup.visible = false;
+  const st = rig.animState;
+  st.lastTime = time;
+
+  // Phase 1 (0..0.45s): brisk victory trot into the temple sanctuary
+  if (finishElapsed < 0.45) {
+    const stride = finishElapsed * 11.5;
+    const pL = stride;
+    const pR = stride + Math.PI;
+    rig.root.rotation.set(0, 0, 0);
+    rig.bodyPivot.position.y = Math.abs(Math.sin(stride)) * 0.05;
+    rig.bodyPivot.rotation.set(-0.1, 0, 0);
+    rig.headGroup.rotation.set(0.08, 0, 0);
+    rig.leftLegPivot.rotation.x = Math.cos(pL) * 0.55;
+    rig.rightLegPivot.rotation.x = Math.cos(pR) * 0.55;
+    rig.leftKneePivot.rotation.x = -0.25 - Math.max(0, -Math.sin(pL)) * 0.8;
+    rig.rightKneePivot.rotation.x = -0.25 - Math.max(0, -Math.sin(pR)) * 0.8;
+    rig.leftArmPivot.rotation.set(-Math.cos(pL) * 0.55, 0, -0.14);
+    rig.rightArmPivot.rotation.set(-Math.cos(pR) * 0.55, 0, 0.14);
+    rig.leftElbowPivot.rotation.x = 0.95;
+    rig.rightElbowPivot.rotation.x = 0.95;
+    rig.scarfTail.rotation.x = -0.45 - Math.sin(time * 14) * 0.08;
+    return 0;
+  }
+
+  // Phase 2 (0.45..2.05s): turn to face camera, celebratory jump & double-arm fist pump!
+  const turnT = THREE.MathUtils.smoothstep(finishElapsed, 0.45, 0.82);
+  rig.root.rotation.set(0, turnT * Math.PI, 0);
+
+  const celT = finishElapsed - 0.55;
+  const hopWave = celT > 0 ? Math.max(0, Math.sin(celT * Math.PI * 2.15)) : 0;
+  const hopHeight = hopWave * 0.62;
+
+  const pump = Math.sin(finishElapsed * 9.5);
+  rig.bodyPivot.position.y = hopWave * 0.04;
+  rig.bodyPivot.rotation.set(0.05 + hopWave * 0.08, pump * 0.08, pump * 0.04);
+  rig.headGroup.rotation.set(-0.08 - hopWave * 0.08, -pump * 0.06, 0);
+
+  // Arms raised in triumphant V-pose with energetic cheer pumps
+  rig.leftArmPivot.rotation.set(-2.35 + pump * 0.22, 0, -0.42 - hopWave * 0.16);
+  rig.rightArmPivot.rotation.set(-2.35 - pump * 0.22, 0, 0.42 + hopWave * 0.16);
+  rig.leftElbowPivot.rotation.x = 0.35 + Math.max(0, -pump) * 0.28;
+  rig.rightElbowPivot.rotation.x = 0.35 + Math.max(0, pump) * 0.28;
+
+  // Knees flex gracefully during takeoff & victory hop
+  const legSpread = hopWave * 0.28;
+  rig.leftLegPivot.rotation.x = legSpread;
+  rig.rightLegPivot.rotation.x = -legSpread * 0.6;
+  rig.leftKneePivot.rotation.x = -0.14 - hopWave * 0.58;
+  rig.rightKneePivot.rotation.x = -0.14 - hopWave * 0.42;
+
+  rig.scarfTail.rotation.x = -0.24 - hopWave * 0.32 - Math.sin(time * 12) * 0.08;
+  rig.scarfTail.rotation.z = Math.cos(time * 9) * 0.07;
+
+  if (rig.wingLeft && rig.wingRight) {
+    const flap = Math.sin(time * 11) * 0.32;
+    rig.wingLeft.rotation.y = 0.3 + flap;
+    rig.wingRight.rotation.y = -0.3 - flap;
+  }
+
+  return hopHeight;
+}
+

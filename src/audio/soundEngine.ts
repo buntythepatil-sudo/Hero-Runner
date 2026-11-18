@@ -1,4 +1,7 @@
 import { BiomeType, GamePhase } from '../types/game';
+import { AfricanDrumEngine } from './africanDrums';
+
+export type TerrainType = 'dirt' | 'grass' | 'stone' | 'wood' | 'ice';
 
 interface BiomeAmbientProfile {
   birds: number;
@@ -60,6 +63,7 @@ export interface AmbientEnvState {
   playerY?: number;
   speedHoriz?: number;
   nearWater?: boolean;
+  rainLevel?: number;
 }
 
 interface AmbientGraph {
@@ -81,9 +85,13 @@ class SoundEngine {
   private pageHidden = false;
 
   private ambient: AmbientGraph | null = null;
+  private musicMasterGain: GainNode | null = null;
+  private drums: AfricanDrumEngine | null = null;
+  private footstepNoiseBuf: AudioBuffer | null = null;
   private schedulerId: number | null = null;
   private nextBirdTime = 0;
   private nextCritterTime = 0;
+  private lastWildlifeScatterAt = 0;
 
   private envState: Required<AmbientEnvState> = {
     biome: 'canopy',
@@ -91,6 +99,7 @@ class SoundEngine {
     playerY: 1,
     speedHoriz: 0,
     nearWater: false,
+    rainLevel: 0,
   };
 
   private effectiveBirdLevel = 0.5;
@@ -382,6 +391,21 @@ class SoundEngine {
       lfos,
     };
 
+    // 5. African Drum Ensemble Background Music
+    const musicMaster = ctx.createGain();
+    musicMaster.gain.setValueAtTime(this._muted || this.pageHidden ? 0.0001 : 1.0, now);
+    musicMaster.connect(ctx.destination);
+    this.musicMasterGain = musicMaster;
+
+    this.drums = new AfricanDrumEngine(ctx, musicMaster, whiteBuffer);
+    this.drums.setState(
+      this.envState.biome,
+      this.envState.phase,
+      this.envState.rainLevel,
+      !(this._muted || this.pageHidden)
+    );
+    this.drums.start();
+
     this.nextBirdTime = now + 0.8;
     this.nextCritterTime = now + 1.4;
 
@@ -399,6 +423,7 @@ class SoundEngine {
       playerY: state.playerY ?? 1,
       speedHoriz: state.speedHoriz ?? 0,
       nearWater: state.nearWater ?? false,
+      rainLevel: state.rainLevel ?? 0,
     };
     if (!this._muted && this.ctx && this.ctx.state === 'running' && !this.ambient) {
       this.ensureAmbientStarted();
@@ -410,7 +435,7 @@ class SoundEngine {
     if (!this.ctx || !this.ambient) return;
 
     const now = this.ctx.currentTime;
-    const { biome, phase, playerY, speedHoriz, nearWater } = this.envState;
+    const { biome, phase, playerY, speedHoriz, nearWater, rainLevel } = this.envState;
     const prof = BIOME_AMBIENT_PROFILES[biome];
 
     // Phase-aware master mix
@@ -426,9 +451,10 @@ class SoundEngine {
     const altitudeNorm = Math.max(0, Math.min(1, (playerY - 0.5) / 7));
     const speedNorm = Math.max(0, Math.min(1, speedHoriz / 14));
     const waterProximityBoost = (nearWater ? 0.34 : 0) + (playerY < 1.0 ? 0.14 : 0) - altitudeNorm * 0.2;
+    const rain = Math.max(0, Math.min(1, rainLevel));
 
     const waterLevel = Math.max(0.08, Math.min(1.3, prof.water * (1 + waterProximityBoost)));
-    const insectLevel = Math.max(0.05, Math.min(1.15, prof.insects * (1 - altitudeNorm * 0.18)));
+    const insectLevel = Math.max(0.05, Math.min(1.15, prof.insects * (1 - altitudeNorm * 0.18) * (1 - rain * 0.45)));
     const breezeLevel = Math.max(0.15, Math.min(1.3, prof.breeze * (1 + altitudeNorm * 0.28 + speedNorm * 0.22)));
     const birdLevel = Math.max(0.05, Math.min(1.2, prof.birds * (1 + altitudeNorm * 0.12)));
 
@@ -437,6 +463,11 @@ class SoundEngine {
 
     const tc = 0.55;
     this.ambient.masterGain.gain.setTargetAtTime(activeMaster, now, 0.28);
+    const isActive = !(this._muted || this.pageHidden);
+    if (this.musicMasterGain) {
+      this.musicMasterGain.gain.setTargetAtTime(isActive ? 1.0 : 0.0001, now, 0.22);
+    }
+    this.drums?.setState(biome, phase, rain, isActive);
     this.ambient.waterGain.gain.setTargetAtTime(0.095 * waterLevel, now, tc);
     this.ambient.waterLowpass.frequency.setTargetAtTime(
       prof.waterCutoff * (1 + (nearWater ? 0.16 : 0)),
@@ -444,10 +475,10 @@ class SoundEngine {
       tc
     );
     this.ambient.waterLowpass.Q.setTargetAtTime(prof.waterQ, now, tc);
-    this.ambient.waterSparkleGain.gain.setTargetAtTime(0.032 * waterLevel * prof.sparkleGain, now, tc);
-    this.ambient.waterSparkleFilter.frequency.setTargetAtTime(prof.sparkleFreq, now, tc);
+    this.ambient.waterSparkleGain.gain.setTargetAtTime(0.032 * waterLevel * prof.sparkleGain + 0.022 * rain, now, tc);
+    this.ambient.waterSparkleFilter.frequency.setTargetAtTime(prof.sparkleFreq + rain * 400, now, tc);
     this.ambient.insectGain.gain.setTargetAtTime(0.026 * insectLevel, now, tc);
-    this.ambient.breezeGain.gain.setTargetAtTime(0.038 * breezeLevel, now, tc);
+    this.ambient.breezeGain.gain.setTargetAtTime(0.038 * breezeLevel + 0.018 * rain, now, tc);
   }
 
   private tickAmbientScheduler() {
@@ -649,12 +680,67 @@ class SoundEngine {
     this.tone(760, 480, 0.09, 'sine', 0.09, 0.085);
   }
 
-  birdFlockFlyover() {
+  wildlifeScatter(kind: 'parrot' | 'butterfly' | 'hummingbird') {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    if (now - this.lastWildlifeScatterAt < 0.35) return;
+    this.lastWildlifeScatterAt = now;
+
+    if (kind === 'parrot') {
+      // Soft startled tropical double-squawk + gentle wing-flutter puff
+      this.scheduleBirdTone(1240, 1680, 0.085, 0, 0.042, (Math.random() - 0.5) * 0.8, 'triangle');
+      this.scheduleBirdTone(1520, 1120, 0.1, 0.095, 0.036, (Math.random() - 0.5) * 0.8, 'triangle');
+      const noiseBuf = this.getFootstepNoiseBuffer(ctx);
+      for (let i = 0; i < 3; i++) {
+        const t = now + i * 0.065;
+        const src = ctx.createBufferSource();
+        src.buffer = noiseBuf;
+        const bp = ctx.createBiquadFilter();
+        bp.type = 'bandpass';
+        bp.frequency.setValueAtTime(900 + i * 180, t);
+        bp.Q.setValueAtTime(1.4, t);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.linearRampToValueAtTime(0.028, t + 0.014);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.055);
+        src.connect(bp);
+        bp.connect(g);
+        g.connect(ctx.destination);
+        src.start(t, Math.random() * 0.1, 0.06);
+      }
+    } else if (kind === 'hummingbird') {
+      this.scheduleBirdTone(2650, 3250, 0.055, 0, 0.022, (Math.random() - 0.5) * 0.7, 'sine');
+      this.scheduleBirdTone(3100, 2500, 0.06, 0.06, 0.018, (Math.random() - 0.5) * 0.7, 'sine');
+    } else {
+      // Soft airy wing shimmer for scattering butterflies
+      const noiseBuf = this.getFootstepNoiseBuffer(ctx);
+      const src = ctx.createBufferSource();
+      src.buffer = noiseBuf;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(2100, now);
+      bp.Q.setValueAtTime(2.0, now);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, now);
+      g.gain.linearRampToValueAtTime(0.016, now + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.14);
+      src.connect(bp);
+      bp.connect(g);
+      g.connect(ctx.destination);
+      src.start(now, Math.random() * 0.1, 0.16);
+    }
+  }
+
+  birdFlockFlyover(variant = 0) {
     const ctx = this.ensureContext();
     if (!ctx) return;
     this.ensureAmbientStarted();
 
     const now = ctx.currentTime;
+    const v = ((variant % 5) + 5) % 5;
+    const pitchMult = [1.0, 0.72, 1.28, 0.88, 1.12][v];
+    const oscPrimary: OscillatorType = v === 1 ? 'sawtooth' : v === 2 ? 'sine' : 'triangle';
 
     // 1. Swooshing wingbeat rush passing from behind overhead into the sky ahead
     const noiseBuf = this.createSeamlessPinkNoiseBuffer(ctx, 1.9);
@@ -664,8 +750,8 @@ class SoundEngine {
     const filter = ctx.createBiquadFilter();
     filter.type = 'bandpass';
     filter.Q.setValueAtTime(1.3, now);
-    filter.frequency.setValueAtTime(320, now);
-    filter.frequency.exponentialRampToValueAtTime(920, now + 0.55);
+    filter.frequency.setValueAtTime(320 * (0.9 + v * 0.05), now);
+    filter.frequency.exponentialRampToValueAtTime(920 * (0.9 + v * 0.05), now + 0.55);
     filter.frequency.exponentialRampToValueAtTime(360, now + 1.65);
 
     const whooshGain = ctx.createGain();
@@ -685,7 +771,7 @@ class SoundEngine {
     noiseSrc.start(now);
     noiseSrc.stop(now + 1.8);
 
-    // 2. Overlapping stereo flock calls sweeping overhead
+    // 2. Overlapping stereo flock calls sweeping overhead (varied per bird species)
     const flockCalls: Array<{
       f1: number;
       f2: number;
@@ -695,12 +781,12 @@ class SoundEngine {
       gain: number;
       type: OscillatorType;
     }> = [
-      { f1: 1480, f2: 2240, dur: 0.14, delay: 0.04, pan: -0.45, gain: 0.075, type: 'triangle' },
-      { f1: 2150, f2: 1620, dur: 0.16, delay: 0.19, pan: -0.25, gain: 0.065, type: 'sine' },
-      { f1: 1850, f2: 2680, dur: 0.12, delay: 0.32, pan: 0.35, gain: 0.08, type: 'triangle' },
-      { f1: 2420, f2: 1790, dur: 0.18, delay: 0.50, pan: 0.15, gain: 0.07, type: 'sine' },
-      { f1: 1680, f2: 2350, dur: 0.13, delay: 0.72, pan: -0.55, gain: 0.055, type: 'sine' },
-      { f1: 2050, f2: 1440, dur: 0.22, delay: 0.94, pan: 0.45, gain: 0.05, type: 'triangle' },
+      { f1: 1480 * pitchMult, f2: 2240 * pitchMult, dur: 0.14, delay: 0.04, pan: -0.45, gain: 0.075, type: oscPrimary },
+      { f1: 2150 * pitchMult, f2: 1620 * pitchMult, dur: 0.16, delay: 0.19, pan: -0.25, gain: 0.065, type: 'sine' },
+      { f1: 1850 * pitchMult, f2: 2680 * pitchMult, dur: 0.12, delay: 0.32, pan: 0.35, gain: 0.08, type: oscPrimary },
+      { f1: 2420 * pitchMult, f2: 1790 * pitchMult, dur: 0.18, delay: 0.50, pan: 0.15, gain: 0.07, type: 'sine' },
+      { f1: 1680 * pitchMult, f2: 2350 * pitchMult, dur: 0.13, delay: 0.72, pan: -0.55, gain: 0.055, type: 'sine' },
+      { f1: 2050 * pitchMult, f2: 1440 * pitchMult, dur: 0.22, delay: 0.94, pan: 0.45, gain: 0.05, type: oscPrimary },
     ];
 
     for (const c of flockCalls) {
@@ -714,7 +800,7 @@ class SoundEngine {
       osc.frequency.exponentialRampToValueAtTime(c.f2, start + c.dur);
 
       gain.gain.setValueAtTime(0.0001, start);
-      gain.gain.linearRampToValueAtTime(c.gain, start + 0.025);
+      gain.gain.linearRampToValueAtTime(c.gain * (oscPrimary === 'sawtooth' ? 0.55 : 1), start + 0.025);
       gain.gain.exponentialRampToValueAtTime(0.0001, start + c.dur);
 
       panner.pan.setValueAtTime(c.pan, start);
@@ -724,6 +810,181 @@ class SoundEngine {
       panner.connect(ctx.destination);
       osc.start(start);
       osc.stop(start + c.dur + 0.03);
+    }
+  }
+
+  private getFootstepNoiseBuffer(ctx: AudioContext): AudioBuffer {
+    if (this.footstepNoiseBuf && this.footstepNoiseBuf.sampleRate === ctx.sampleRate) {
+      return this.footstepNoiseBuf;
+    }
+    const len = Math.floor(ctx.sampleRate * 0.35);
+    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < len; i++) {
+      const white = Math.random() * 2 - 1;
+      last = (last + 0.08 * white) / 1.08;
+      data[i] = white * 0.65 + last * 1.4;
+    }
+    this.footstepNoiseBuf = buf;
+    return buf;
+  }
+
+  public footstep(terrain: TerrainType, intensity = 1) {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+
+    const now = ctx.currentTime;
+    const pitchJitter = 0.92 + Math.random() * 0.16;
+    const volScale = Math.min(1.35, Math.max(0.55, intensity)) * (0.88 + Math.random() * 0.22);
+    const noiseBuf = this.getFootstepNoiseBuffer(ctx);
+
+    if (terrain === 'grass') {
+      // Soft leafy brush + muted earthy pad
+      const src = ctx.createBufferSource();
+      src.buffer = noiseBuf;
+      src.playbackRate.setValueAtTime(1.05 * pitchJitter, now);
+
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(1750 * pitchJitter, now);
+      bp.frequency.exponentialRampToValueAtTime(980, now + 0.075);
+      bp.Q.setValueAtTime(1.15, now);
+
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, now);
+      g.gain.linearRampToValueAtTime(0.065 * volScale, now + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.085);
+
+      src.connect(bp);
+      bp.connect(g);
+      g.connect(ctx.destination);
+      src.start(now, Math.random() * 0.15, 0.1);
+
+      const thump = ctx.createOscillator();
+      const thumpG = ctx.createGain();
+      thump.type = 'sine';
+      thump.frequency.setValueAtTime(105 * pitchJitter, now);
+      thump.frequency.exponentialRampToValueAtTime(52, now + 0.05);
+      thumpG.gain.setValueAtTime(0.032 * volScale, now);
+      thumpG.gain.exponentialRampToValueAtTime(0.0001, now + 0.055);
+      thump.connect(thumpG);
+      thumpG.connect(ctx.destination);
+      thump.start(now);
+      thump.stop(now + 0.06);
+    } else if (terrain === 'dirt') {
+      // Gritty dry earth crunch + warm thud
+      const src = ctx.createBufferSource();
+      src.buffer = noiseBuf;
+      src.playbackRate.setValueAtTime(0.9 * pitchJitter, now);
+
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(920 * pitchJitter, now);
+      bp.frequency.exponentialRampToValueAtTime(480, now + 0.075);
+      bp.Q.setValueAtTime(1.45, now);
+
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, now);
+      g.gain.linearRampToValueAtTime(0.078 * volScale, now + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.085);
+
+      src.connect(bp);
+      bp.connect(g);
+      g.connect(ctx.destination);
+      src.start(now, Math.random() * 0.15, 0.1);
+
+      const thump = ctx.createOscillator();
+      const thumpG = ctx.createGain();
+      thump.type = 'triangle';
+      thump.frequency.setValueAtTime(138 * pitchJitter, now);
+      thump.frequency.exponentialRampToValueAtTime(58, now + 0.055);
+      thumpG.gain.setValueAtTime(0.055 * volScale, now);
+      thumpG.gain.exponentialRampToValueAtTime(0.0001, now + 0.06);
+      thump.connect(thumpG);
+      thumpG.connect(ctx.destination);
+      thump.start(now);
+      thump.stop(now + 0.065);
+    } else if (terrain === 'stone') {
+      // Crisp hard heel clack + stony transient
+      const osc = ctx.createOscillator();
+      const oscG = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(340 * pitchJitter, now);
+      osc.frequency.exponentialRampToValueAtTime(115, now + 0.042);
+      oscG.gain.setValueAtTime(0.075 * volScale, now);
+      oscG.gain.exponentialRampToValueAtTime(0.0001, now + 0.048);
+      osc.connect(oscG);
+      oscG.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.055);
+
+      const src = ctx.createBufferSource();
+      src.buffer = noiseBuf;
+      src.playbackRate.setValueAtTime(1.25 * pitchJitter, now);
+      const hp = ctx.createBiquadFilter();
+      hp.type = 'highpass';
+      hp.frequency.setValueAtTime(1600, now);
+      const ng = ctx.createGain();
+      ng.gain.setValueAtTime(0.055 * volScale, now);
+      ng.gain.exponentialRampToValueAtTime(0.0001, now + 0.035);
+      src.connect(hp);
+      hp.connect(ng);
+      ng.connect(ctx.destination);
+      src.start(now, Math.random() * 0.15, 0.045);
+    } else if (terrain === 'wood') {
+      // Hollow resonant plank knock
+      const bodyOsc = ctx.createOscillator();
+      const bodyG = ctx.createGain();
+      bodyOsc.type = 'sine';
+      bodyOsc.frequency.setValueAtTime(225 * pitchJitter, now);
+      bodyOsc.frequency.exponentialRampToValueAtTime(118, now + 0.058);
+      bodyG.gain.setValueAtTime(0.088 * volScale, now);
+      bodyG.gain.exponentialRampToValueAtTime(0.0001, now + 0.065);
+      bodyOsc.connect(bodyG);
+      bodyG.connect(ctx.destination);
+      bodyOsc.start(now);
+      bodyOsc.stop(now + 0.07);
+
+      const knock = ctx.createOscillator();
+      const knockG = ctx.createGain();
+      knock.type = 'triangle';
+      knock.frequency.setValueAtTime(720 * pitchJitter, now);
+      knock.frequency.exponentialRampToValueAtTime(380, now + 0.025);
+      knockG.gain.setValueAtTime(0.04 * volScale, now);
+      knockG.gain.exponentialRampToValueAtTime(0.0001, now + 0.03);
+      knock.connect(knockG);
+      knockG.connect(ctx.destination);
+      knock.start(now);
+      knock.stop(now + 0.035);
+    } else {
+      // Ice: crisp glassy scrape + high crystalline tick
+      const src = ctx.createBufferSource();
+      src.buffer = noiseBuf;
+      src.playbackRate.setValueAtTime(1.4 * pitchJitter, now);
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(2900 * pitchJitter, now);
+      bp.Q.setValueAtTime(2.6, now);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.052 * volScale, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.055);
+      src.connect(bp);
+      bp.connect(g);
+      g.connect(ctx.destination);
+      src.start(now, Math.random() * 0.15, 0.065);
+
+      const tick = ctx.createOscillator();
+      const tickG = ctx.createGain();
+      tick.type = 'sine';
+      tick.frequency.setValueAtTime(580 * pitchJitter, now);
+      tick.frequency.exponentialRampToValueAtTime(240, now + 0.03);
+      tickG.gain.setValueAtTime(0.04 * volScale, now);
+      tickG.gain.exponentialRampToValueAtTime(0.0001, now + 0.035);
+      tick.connect(tickG);
+      tickG.connect(ctx.destination);
+      tick.start(now);
+      tick.stop(now + 0.04);
     }
   }
 }

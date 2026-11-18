@@ -22,44 +22,64 @@ const LEVEL_NAMES: string[] = [
   'Canopy Stepping Stones',
   'Bouncing Grove',
   'Jaguar Bridge',
+  'Emerald Vine Walk',
+  'Howler Hollow',
+  'Sunbeam Overlook',
+  'Treetop Switchback',
+  'Golden Orchid Run',
   'Mossy Canyon Gate',
   'Shattered Causeway',
   'Pendulum Gorge',
   'Boulder Run Ridge',
   'Ancient Sunken Plaza',
+  'Carved Idol Pass',
+  'Relic Archway',
+  'Sandstone Gauntlet',
+  'Sunken Courtyard',
+  'Temple Terrace',
   'Mistfall Rapids',
   'Slick Stone Walkway',
   'Twin Cascade Cliffs',
   'Sweeper Gauntlet',
   'Twilight Spire Ascent',
+  'Silver Spray Bridge',
+  'Frosted Ledge Run',
+  'Torrent Gorge',
+  'Glacier Mist Crossing',
+  'Cascading Summit',
   'Basalt Rim Trail',
   'Magma Chasm Hop',
   'Cinder Pendulum Keep',
   'Obsidian Switchback',
+  'Ashfall Causeway',
+  'Molten Archway',
+  'Ember Crown Ridge',
+  'Caldera Gauntlet',
+  'Inferno Spire',
   "Emperor's Summit Gauntlet",
 ];
 
 function getBiomeForLevel(level: number): BiomeType {
-  if (level <= 5) return 'canopy';
-  if (level <= 10) return 'ruins';
-  if (level <= 15) return 'waterfall';
+  if (level <= 10) return 'canopy';
+  if (level <= 20) return 'ruins';
+  if (level <= 30) return 'waterfall';
   return 'volcano';
 }
 
 function getDifficultyLabel(level: number): string {
-  if (level <= 4) return 'Gentle';
-  if (level <= 8) return 'Moderate';
-  if (level <= 13) return 'Challenging';
-  if (level <= 17) return 'Intense';
+  if (level <= 8) return 'Gentle';
+  if (level <= 16) return 'Moderate';
+  if (level <= 26) return 'Challenging';
+  if (level <= 34) return 'Intense';
   return 'Master';
 }
 
 function buildLevel(levelNumber: number): LevelSpec {
   const rand = seededRandom(levelNumber * 7919 + 1337);
   const biome = getBiomeForLevel(levelNumber);
-  const difficulty = (levelNumber - 1) / 19; // 0.0 -> 1.0
+  const difficulty = (levelNumber - 1) / 39; // 0.0 -> 1.0
 
-  const courseLength = 125 + levelNumber * 12; // 137m -> 365m
+  const courseLength = 220 + levelNumber * 15; // 235m -> 820m
   const baseWidth = Math.max(4.4, 8.6 - difficulty * 3.8);
   const platforms: PlatformSegmentSpec[] = [];
   const obstacles: ObstacleSpec[] = [];
@@ -345,7 +365,7 @@ function buildLevel(levelNumber: number): LevelSpec {
     name: LEVEL_NAMES[levelNumber - 1] ?? `Stage ${levelNumber}`,
     biome,
     difficultyLabel: getDifficultyLabel(levelNumber),
-    parTime: Math.round(28 + levelNumber * 3.5),
+    parTime: Math.round(34 + levelNumber * 2.5),
     length: Math.abs(goalPlatZ - 4),
     gravity: -28 - difficulty * 3,
     groundFriction: biome === 'waterfall' ? 0.25 : 0.6,
@@ -358,11 +378,11 @@ function buildLevel(levelNumber: number): LevelSpec {
   };
 }
 
-export const ALL_LEVELS: LevelSpec[] = Array.from({ length: 20 }, (_, idx) =>
+export const ALL_LEVELS: LevelSpec[] = Array.from({ length: 40 }, (_, idx) =>
   buildLevel(idx + 1)
 );
 
 export function getLevelSpec(levelNumber: number): LevelSpec {
-  const clamped = Math.max(1, Math.min(20, levelNumber));
+  const clamped = Math.max(1, Math.min(40, levelNumber));
   return ALL_LEVELS[clamped - 1];
 }

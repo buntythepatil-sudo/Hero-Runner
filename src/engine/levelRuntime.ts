@@ -1,6 +1,6 @@
 import * as CANNON from 'cannon-es';
 import * as THREE from 'three';
-import { soundEngine } from '../audio/soundEngine';
+import { soundEngine, TerrainType } from '../audio/soundEngine';
 import {
   BiomeType,
   LevelSpec,
@@ -8,6 +8,7 @@ import {
   PlatformSegmentSpec,
   PowerUpType,
 } from '../types/game';
+import { AmbientWildlifeSystem, WildlifeAnchor } from './ambientWildlife';
 import { ProceduralTextureSet } from './textures';
 
 export interface BiomePalette {
@@ -210,11 +211,63 @@ export class LevelPhysicsRuntime {
   private coinGeo: THREE.CylinderGeometry;
   private coinMat: THREE.MeshStandardMaterial;
   private particleGeo: THREE.SphereGeometry;
-  private swayNodes: { obj: THREE.Object3D; baseRotZ: number; baseRotX: number; speed: number; phase: number }[] = [];
+  private swayNodes: {
+    obj: THREE.Object3D;
+    baseRotZ: number;
+    baseRotX: number;
+    speed: number;
+    phase: number;
+    worldX: number;
+    worldZ: number;
+    side: number;
+    amp: number;
+    wake: number;
+    wakeVel: number;
+  }[] = [];
 
-  private levelMonkeyThrowUsed = false;
-  private birdFlyoverTriggered = false;
+  private sceneryTrunks: THREE.InstancedMesh | null = null;
+  private sceneryCanopies: THREE.InstancedMesh | null = null;
+  private sceneryBlades: THREE.InstancedMesh | null = null;
+  private sceneryTreeData: {
+    x: number;
+    y: number;
+    z: number;
+    scale: number;
+    side: number;
+    rotY: number;
+    bend: number;
+    bendVel: number;
+    phase: number;
+  }[] = [];
+  private sceneryBladeData: {
+    x: number;
+    y: number;
+    z: number;
+    scaleY: number;
+    side: number;
+    baseRotX: number;
+    baseRotY: number;
+    baseRotZ: number;
+    bend: number;
+    bendVel: number;
+    phase: number;
+  }[] = [];
+  private swayDummy = new THREE.Object3D();
+  private shadowRayFrom = new CANNON.Vec3();
+  private shadowRayTo = new CANNON.Vec3();
+  private shadowRayResult = new CANNON.RaycastResult();
+
+  private footstepAcc = 0;
+  private wasGrounded = false;
+  private jumpHoldTimer = 0;
+  private birdFlyoverStarted = false;
+  private birdFlyoverTimer = 20;
+  private birdFlockIndex = 0;
   private elapsed = 0;
+  private goalRing: THREE.Mesh | null = null;
+  private finishFireworkTimer = 0;
+  private wildlifeAnchors: WildlifeAnchor[] = [];
+  private ambientWildlife: AmbientWildlifeSystem;
 
   constructor(spec: LevelSpec, textures: ProceduralTextureSet) {
     this.spec = spec;
@@ -273,6 +326,15 @@ export class LevelPhysicsRuntime {
     this.buildObstacles();
     this.buildCoins();
     this.buildGoalTemple();
+
+    this.ambientWildlife = new AmbientWildlifeSystem(
+      this.wildlifeAnchors,
+      this.spec.biome,
+      this.spec.levelNumber,
+      this.spec.goalZ,
+      this.spec.goalY
+    );
+    this.levelGroup.add(this.ambientWildlife.group);
   }
 
   private buildScenery() {
@@ -323,7 +385,7 @@ export class LevelPhysicsRuntime {
       roughness: 0.86,
       metalness: 0.06,
     });
-    const pillarCount = 44;
+    const pillarCount = Math.max(44, Math.round(this.spec.length * 0.22));
     const pillarGeo = new THREE.BoxGeometry(2.2, 16, 2.4);
     const pillars = new THREE.InstancedMesh(pillarGeo, stoneMat, pillarCount);
     const dummy = new THREE.Object3D();
@@ -342,7 +404,7 @@ export class LevelPhysicsRuntime {
     this.levelGroup.add(pillars);
 
     // 4. Colossal Misty Background Stone Arches / Ancient Tree Roots rising out of the water
-    const archCount = 14;
+    const archCount = Math.max(14, Math.round(this.spec.length * 0.07));
     const archGeo = new THREE.TorusGeometry(14, 1.9, 10, 22, Math.PI * 0.85);
     const arches = new THREE.InstancedMesh(archGeo, stoneMat, archCount);
     for (let i = 0; i < archCount; i++) {
@@ -358,7 +420,7 @@ export class LevelPhysicsRuntime {
     this.levelGroup.add(arches);
 
     // 5. Realistic Curved Jungle Canopy Trees with Multi-Tier Lush Foliage
-    const treeCount = 96;
+    const treeCount = Math.max(96, Math.round(this.spec.length * 0.48));
     const trunkCurve = new THREE.CatmullRomCurve3([
       new THREE.Vector3(0, -4.5, 0),
       new THREE.Vector3(0.35, -1.5, 0.15),
@@ -384,6 +446,7 @@ export class LevelPhysicsRuntime {
     const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, treeCount);
     const canopies = new THREE.InstancedMesh(canopyGeo, canopyMat, treeCount * 2);
     const tint = new THREE.Color();
+    this.sceneryTreeData = [];
 
     for (let i = 0; i < treeCount; i++) {
       const side = i % 2 === 0 ? -1 : 1;
@@ -391,10 +454,23 @@ export class LevelPhysicsRuntime {
       const xPos = side * (10.5 + ((i * 31) % 14));
       const yPos = -6.0 + ((i * 17) % 6);
       const scale = 0.92 + ((i * 13) % 40) / 100;
+      const rotY = (i * 1.1) % Math.PI;
+
+      this.sceneryTreeData.push({
+        x: xPos,
+        y: yPos,
+        z: zPos,
+        scale,
+        side,
+        rotY,
+        bend: 0,
+        bendVel: 0,
+        phase: i * 0.73,
+      });
 
       dummy.position.set(xPos, yPos + 4.2 * scale, zPos);
       dummy.scale.set(scale, scale, scale);
-      dummy.rotation.set(0, (i * 1.1) % Math.PI, side * -0.08);
+      dummy.rotation.set(0, rotY, side * -0.08);
       dummy.updateMatrix();
       trunks.setMatrixAt(i, dummy.matrix);
 
@@ -416,28 +492,49 @@ export class LevelPhysicsRuntime {
 
     trunks.computeBoundingSphere();
     canopies.computeBoundingSphere();
+    this.sceneryTrunks = trunks;
+    this.sceneryCanopies = canopies;
     this.levelGroup.add(trunks, canopies);
 
     // 6. Lush Sharp Jungle Grass / Fern Blades sprouting along the canyon ledges
-    const grassCount = 220;
+    const grassCount = Math.max(220, Math.round(this.spec.length * 1.1));
     const bladeGeo = new THREE.ConeGeometry(0.18, 1.75, 4);
     const bladeMat = new THREE.MeshStandardMaterial({
       color: isVolcano ? 0x6b4f3a : 0x76b82a,
       roughness: 0.7,
     });
     const blades = new THREE.InstancedMesh(bladeGeo, bladeMat, grassCount);
+    this.sceneryBladeData = [];
     for (let i = 0; i < grassCount; i++) {
       const side = i % 2 === 0 ? -1 : 1;
       const zPos = 8 - (i / grassCount) * (this.spec.length + 45);
       const xPos = side * (6.4 + ((i * 19) % 7));
       const yPos = -1.6 + ((i * 11) % 3);
+      const baseRotX = ((i % 5) - 2) * 0.14;
+      const baseRotY = i * 0.9;
+      const baseRotZ = side * 0.3;
+      const scaleY = 0.85 + (i % 4) * 0.3;
+      this.sceneryBladeData.push({
+        x: xPos,
+        y: yPos,
+        z: zPos,
+        scaleY,
+        side,
+        baseRotX,
+        baseRotY,
+        baseRotZ,
+        bend: 0,
+        bendVel: 0,
+        phase: i * 0.51,
+      });
       dummy.position.set(xPos, yPos, zPos);
-      dummy.rotation.set(((i % 5) - 2) * 0.14, i * 0.9, side * 0.3);
-      dummy.scale.set(1, 0.85 + (i % 4) * 0.3, 1);
+      dummy.rotation.set(baseRotX, baseRotY, baseRotZ);
+      dummy.scale.set(1, scaleY, 1);
       dummy.updateMatrix();
       blades.setMatrixAt(i, dummy.matrix);
     }
     blades.computeBoundingSphere();
+    this.sceneryBlades = blades;
     this.levelGroup.add(blades);
   }
 
@@ -620,6 +717,15 @@ export class LevelPhysicsRuntime {
           railWall.position.set(sx * (p.width * 0.48), 0.24, 0);
           railWall.castShadow = true;
           group.add(railWall);
+
+          this.wildlifeAnchors.push({
+            x: p.x + sx * (p.width * 0.48),
+            y: p.y + 0.52,
+            z: p.z,
+            side: sx,
+            hasFlower: false,
+            platformKind: p.kind,
+          });
         }
       } else {
         // Living Uneven Gnarled 3D Tree Branch Bough!
@@ -667,7 +773,8 @@ export class LevelPhysicsRuntime {
           }
 
           // Eye-catching colorful jungle blossoms blooming along the live branch
-          if (t % 2 === 0 && this.spec.biome !== 'volcano') {
+          const hasFlower = t % 2 === 0 && this.spec.biome !== 'volcano';
+          if (hasFlower) {
             const flowerMat = new THREE.MeshStandardMaterial({
               color: flowerColors[(t + this.spec.levelNumber) % flowerColors.length],
               emissive: flowerColors[(t + this.spec.levelNumber) % flowerColors.length],
@@ -678,6 +785,17 @@ export class LevelPhysicsRuntime {
             flower.scale.set(1.2, 0.55, 1.2);
             flower.position.set(side * 0.35, p.height * 0.42, 0.2);
             sproutPivot.add(flower);
+          }
+
+          if (p.kind !== 'moving' && p.kind !== 'crumbling') {
+            this.wildlifeAnchors.push({
+              x: p.x + off.dx + side * (p.width * 0.47),
+              y: p.y + off.dy + p.height * 0.5,
+              z: p.z + tz,
+              side,
+              hasFlower,
+              platformKind: p.kind,
+            });
           }
 
           // Hanging curved liana tendril dangling beneath the branch
@@ -691,6 +809,36 @@ export class LevelPhysicsRuntime {
             sproutPivot.add(tendril);
           }
 
+          // Lush roadside jungle bush cluster perched right at branch edge
+          const bushPivot = new THREE.Group();
+          bushPivot.position.set(off.dx + side * (p.width * 0.49), off.dy + p.height * 0.44, tz);
+          const bushLeafGeo = new THREE.DodecahedronGeometry(0.36, 0);
+          for (let b = 0; b < 3; b++) {
+            const puff = new THREE.Mesh(bushLeafGeo, leafMat);
+            puff.position.set(
+              side * (0.10 + b * 0.14),
+              0.14 + (b === 1 ? 0.14 : 0),
+              (b - 1) * 0.24
+            );
+            puff.scale.set(1.15, 0.85 + (b % 2) * 0.2, 1.05);
+            puff.castShadow = true;
+            bushPivot.add(puff);
+          }
+          group.add(bushPivot);
+          this.swayNodes.push({
+            obj: bushPivot,
+            baseRotZ: 0,
+            baseRotX: 0,
+            speed: 1.8 + (t % 3) * 0.4,
+            phase: tz * 0.6 + t * 1.3,
+            worldX: p.x + off.dx + side * (p.width * 0.49),
+            worldZ: p.z + tz,
+            side,
+            amp: 0.06,
+            wake: 0,
+            wakeVel: 0,
+          });
+
           group.add(sproutPivot);
           this.swayNodes.push({
             obj: sproutPivot,
@@ -698,6 +846,12 @@ export class LevelPhysicsRuntime {
             baseRotX: 0,
             speed: 1.5 + (t % 3) * 0.35,
             phase: tz * 0.5 + t,
+            worldX: p.x + off.dx + side * (p.width * 0.48),
+            worldZ: p.z + tz,
+            side,
+            amp: 0.075,
+            wake: 0,
+            wakeVel: 0,
           });
         }
 
@@ -787,6 +941,7 @@ export class LevelPhysicsRuntime {
         body = new CANNON.Body({
           mass: 0,
           type: CANNON.Body.STATIC,
+          material: this.defaultPhysMat,
           position: new CANNON.Vec3(placedX, placedY + 0.58, o.z),
         });
         body.addShape(new CANNON.Box(new CANNON.Vec3(0.58, 0.58, 0.58)));
@@ -866,7 +1021,10 @@ export class LevelPhysicsRuntime {
         body = new CANNON.Body({
           mass: 0,
           type: CANNON.Body.STATIC,
+          material: this.defaultPhysMat,
           position: new CANNON.Vec3(placedX, placedY, o.z),
+          collisionResponse: false,
+          collisionFilterGroup: 4,
         });
         body.addShape(new CANNON.Box(new CANNON.Vec3(0.62, 0.62, 0.62)));
         this.world.addBody(body);
@@ -1126,6 +1284,7 @@ export class LevelPhysicsRuntime {
     // Center Victory Beacon Ring
     const ring = new THREE.Mesh(new THREE.TorusGeometry(1.15, 0.12, 10, 24), goldMat);
     ring.position.set(0, 1.8, 0);
+    this.goalRing = ring;
 
     goalGroup.add(lintel, banner, ring);
     this.levelGroup.add(goalGroup);
@@ -1233,8 +1392,23 @@ export class LevelPhysicsRuntime {
     });
     const glintMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
 
-    const monkeyCount = Math.min(9, 4 + Math.floor(this.spec.levelNumber / 3));
-    const throwerIdx = monkeyCount > 1 ? 1 : 0;
+    const throwerCount = 1 + Math.floor((this.spec.levelNumber - 1) / 5);
+    const monkeyCount = Math.max(
+      throwerCount + 2,
+      Math.min(18, 4 + Math.floor(this.spec.levelNumber / 3))
+    );
+    const throwerIndices = new Set<number>();
+    const available = monkeyCount - 1;
+    for (let t = 0; t < throwerCount; t++) {
+      const idx =
+        throwerCount >= available
+          ? 1 + t
+          : 1 + Math.round((t + 0.5) * (available / throwerCount) - 0.5);
+      throwerIndices.add(Math.min(monkeyCount - 1, Math.max(1, idx)));
+    }
+    for (let idx = 1; idx < monkeyCount && throwerIndices.size < throwerCount; idx++) {
+      throwerIndices.add(idx);
+    }
     const startZ = -23;
     const endZ = this.spec.goalZ + 20;
     const span = Math.abs(endZ - startZ);
@@ -1283,25 +1457,42 @@ export class LevelPhysicsRuntime {
       limb.receiveShadow = true;
       treeGroup.add(limb);
 
-      // Lush Jungle Canopy + Hanging Banana Bunch
+      // Lush Jungle Canopy + Hanging Banana Bunch wrapped in reactive sway pivot
+      const canopyPivot = new THREE.Group();
+      canopyPivot.position.set(trunkX, platTopY + 5.8, 0);
+
       const canopy = new THREE.Mesh(new THREE.DodecahedronGeometry(2.7, 1), leafMat);
       canopy.scale.set(1.25, 0.65, 1.15);
-      canopy.position.set(trunkX - side * 0.5, platTopY + 7.2, 0);
+      canopy.position.set(-side * 0.5, 1.4, 0);
       const canopySide = new THREE.Mesh(new THREE.DodecahedronGeometry(1.9, 1), leafMat);
       canopySide.scale.set(1.1, 0.65, 1.0);
-      canopySide.position.set(perchX + side * 0.5, platTopY + 6.4, 0.4);
-      treeGroup.add(canopy, canopySide);
+      canopySide.position.set(perchX - trunkX + side * 0.5, 0.6, 0.4);
+      canopyPivot.add(canopy, canopySide);
 
       // Hanging cluster of yellow bananas under the canopy limb
       const bunchGroup = new THREE.Group();
-      bunchGroup.position.set((trunkX + perchX) * 0.5, perchY + 2.3, 0);
+      bunchGroup.position.set((perchX - trunkX) * 0.5, perchY + 2.3 - (platTopY + 5.8), 0);
       for (let b = 0; b < 3; b++) {
         const ban = this.createBananaMesh(1.35);
         ban.rotation.set(0.2, b * 1.1, -Math.PI * 0.45);
         ban.position.set((b - 1) * 0.12, -0.18, (b % 2) * 0.1);
         bunchGroup.add(ban);
       }
-      treeGroup.add(bunchGroup);
+      canopyPivot.add(bunchGroup);
+      treeGroup.add(canopyPivot);
+      this.swayNodes.push({
+        obj: canopyPivot,
+        baseRotZ: 0,
+        baseRotX: 0,
+        speed: 1.25 + (i % 3) * 0.25,
+        phase: i * 1.1,
+        worldX: trunkX,
+        worldZ: targetZ,
+        side,
+        amp: 0.045,
+        wake: 0,
+        wakeVel: 0,
+      });
       this.levelGroup.add(treeGroup);
 
       // Sculpted Expressive 3D Monkey seated on the tree branch (+Z = face front in local space)
@@ -1405,7 +1596,7 @@ export class LevelPhysicsRuntime {
         handBanana,
         pos: monkeyPos,
         side,
-        canThrow: i === throwerIdx,
+        canThrow: throwerIndices.has(i),
         hasThrown: false,
         throwCooldown: 0,
         windupTimer: 0,
@@ -1442,7 +1633,7 @@ export class LevelPhysicsRuntime {
 
   public triggerJump(inputJumpPressed: boolean) {
     if (inputJumpPressed) {
-      this.jumpBufferTimer = 0.14;
+      this.jumpBufferTimer = 0.16;
     }
   }
 
@@ -1478,13 +1669,17 @@ export class LevelPhysicsRuntime {
   private createSkyBirdMesh(
     bodyHex: number,
     wingTipHex: number,
-    scale: number
+    scale: number,
+    breastHex = 0xfef3c7,
+    beakHex = 0xf59e0b,
+    beakScale = 1.0,
+    wingSpanScale = 1.0
   ): { root: THREE.Group; leftWingPivot: THREE.Group; rightWingPivot: THREE.Group } {
     const root = new THREE.Group();
     const bodyMat = new THREE.MeshStandardMaterial({ color: bodyHex, roughness: 0.42 });
-    const breastMat = new THREE.MeshStandardMaterial({ color: 0xfef3c7, roughness: 0.5 });
+    const breastMat = new THREE.MeshStandardMaterial({ color: breastHex, roughness: 0.5 });
     const tipMat = new THREE.MeshStandardMaterial({ color: wingTipHex, roughness: 0.45 });
-    const beakMat = new THREE.MeshStandardMaterial({ color: 0xf59e0b, roughness: 0.35 });
+    const beakMat = new THREE.MeshStandardMaterial({ color: beakHex, roughness: 0.35 });
     const eyeMat = new THREE.MeshBasicMaterial({ color: 0x0f172a });
 
     // Streamlined body pointing toward -Z
@@ -1499,9 +1694,12 @@ export class LevelPhysicsRuntime {
     // Sculpted head + beak facing -Z
     const head = new THREE.Mesh(new THREE.SphereGeometry(0.14, 10, 10), bodyMat);
     head.position.set(0, 0.08, -0.40);
-    const beak = new THREE.Mesh(new THREE.ConeGeometry(0.055, 0.18, 8), beakMat);
+    const beak = new THREE.Mesh(
+      new THREE.ConeGeometry(0.055 * beakScale, 0.18 * beakScale, 8),
+      beakMat
+    );
     beak.rotation.x = -Math.PI / 2;
-    beak.position.set(0, 0.06, -0.56);
+    beak.position.set(0, 0.06, -0.48 - 0.08 * beakScale);
     root.add(body, breast, head, beak);
 
     for (const sx of [-1, 1]) {
@@ -1522,13 +1720,19 @@ export class LevelPhysicsRuntime {
       const pivot = new THREE.Group();
       pivot.position.set(side * 0.14, 0.05, -0.05);
 
-      const inner = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.04, 0.34), bodyMat);
-      inner.position.set(side * 0.28, 0, 0.02);
+      const inner = new THREE.Mesh(
+        new THREE.BoxGeometry(0.55 * wingSpanScale, 0.04, 0.34),
+        bodyMat
+      );
+      inner.position.set(side * 0.28 * wingSpanScale, 0, 0.02);
       inner.rotation.y = side * -0.18;
       inner.castShadow = true;
 
-      const outer = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.032, 0.22), tipMat);
-      outer.position.set(side * 0.72, 0, 0.12);
+      const outer = new THREE.Mesh(
+        new THREE.BoxGeometry(0.45 * wingSpanScale, 0.032, 0.22),
+        tipMat
+      );
+      outer.position.set(side * 0.72 * wingSpanScale, 0, 0.12);
       outer.rotation.y = side * -0.36;
       outer.castShadow = true;
 
@@ -1545,38 +1749,118 @@ export class LevelPhysicsRuntime {
   }
 
   private spawnSkyBirdFlock(px: number, py: number, pz: number) {
-    const biomeColors: Array<[number, number]> =
-      this.spec.biome === 'volcano'
-        ? [
-            [0x78350f, 0xf59e0b],
-            [0x57534e, 0xfb923c],
-          ]
-        : this.spec.biome === 'ruins'
-        ? [
-            [0x0284c7, 0xfde047],
-            [0xb45309, 0xfef08a],
-          ]
-        : [
-            [0xef4444, 0x3b82f6],
-            [0x10b981, 0xfacc15],
-            [0x0ea5e9, 0xfbbf24],
-          ];
+    const speciesIdx = this.birdFlockIndex % 5;
+    this.birdFlockIndex += 1;
 
-    const flockOffsets = [
-      { dx: 0, dy: 6.4, dz: 12.2, scale: 1.15 },
-      { dx: -1.65, dy: 6.7, dz: 13.8, scale: 1.05 },
-      { dx: 1.7, dy: 6.6, dz: 14.1, scale: 1.08 },
-      { dx: -3.2, dy: 7.1, dz: 15.6, scale: 0.96 },
-      { dx: 3.3, dy: 7.0, dz: 15.9, scale: 1.0 },
-      { dx: 0.4, dy: 7.5, dz: 17.1, scale: 0.92 },
+    // 5 distinct bird flocks rotating on every 20s flyover
+    const speciesConfigs = [
+      {
+        // 0. Scarlet Macaws in V-formation
+        colors: [
+          { body: 0xef4444, tip: 0x2563eb, breast: 0xfacc15, beak: 0xfef3c7 },
+          { body: 0x10b981, tip: 0xfacc15, breast: 0xef4444, beak: 0xfef3c7 },
+        ],
+        beakScale: 1.15,
+        wingSpan: 1.05,
+        baseSpeedZ: -25.5,
+        flapBase: 13.5,
+        offsets: [
+          { dx: 0, dy: 6.4, dz: 12.2, scale: 1.15 },
+          { dx: -1.65, dy: 6.7, dz: 13.8, scale: 1.05 },
+          { dx: 1.7, dy: 6.6, dz: 14.1, scale: 1.08 },
+          { dx: -3.2, dy: 7.1, dz: 15.6, scale: 0.96 },
+          { dx: 3.3, dy: 7.0, dz: 15.9, scale: 1.0 },
+          { dx: 0.4, dy: 7.5, dz: 17.1, scale: 0.92 },
+        ],
+      },
+      {
+        // 1. Jungle Toucans in staggered diagonal echelon
+        colors: [
+          { body: 0x1c1917, tip: 0xfde047, breast: 0xf59e0b, beak: 0xf97316 },
+          { body: 0x292524, tip: 0x22c55e, breast: 0xfacc15, beak: 0xf97316 },
+        ],
+        beakScale: 1.95,
+        wingSpan: 0.95,
+        baseSpeedZ: -22.5,
+        flapBase: 11.8,
+        offsets: [
+          { dx: -2.4, dy: 6.2, dz: 12.0, scale: 1.24 },
+          { dx: -0.9, dy: 6.6, dz: 13.4, scale: 1.18 },
+          { dx: 0.7, dy: 6.9, dz: 14.9, scale: 1.22 },
+          { dx: 2.3, dy: 7.3, dz: 16.3, scale: 1.12 },
+          { dx: 3.6, dy: 7.7, dz: 17.7, scale: 1.08 },
+        ],
+      },
+      {
+        // 2. Azure Kingfishers — fast agile darting wedge
+        colors: [
+          { body: 0x0ea5e9, tip: 0xe0f2fe, breast: 0xf97316, beak: 0x334155 },
+          { body: 0x0284c7, tip: 0x7dd3fc, breast: 0xfbbf24, beak: 0x334155 },
+        ],
+        beakScale: 1.25,
+        wingSpan: 0.92,
+        baseSpeedZ: -29.0,
+        flapBase: 17.2,
+        offsets: [
+          { dx: 0.2, dy: 5.9, dz: 11.6, scale: 0.92 },
+          { dx: -1.1, dy: 6.2, dz: 12.9, scale: 0.86 },
+          { dx: 1.4, dy: 6.1, dz: 13.1, scale: 0.88 },
+          { dx: -2.3, dy: 6.6, dz: 14.5, scale: 0.84 },
+          { dx: 0.1, dy: 6.5, dz: 14.7, scale: 0.85 },
+          { dx: 2.6, dy: 6.7, dz: 14.9, scale: 0.82 },
+          { dx: -0.9, dy: 7.0, dz: 16.2, scale: 0.80 },
+        ],
+      },
+      {
+        // 3. Snowy Egrets — graceful wide-winged soaring arc
+        colors: [
+          { body: 0xf8fafc, tip: 0xcbd5e1, breast: 0xffffff, beak: 0xf59e0b },
+          { body: 0xf1f5f9, tip: 0xfde68a, breast: 0xffffff, beak: 0xf97316 },
+        ],
+        beakScale: 1.45,
+        wingSpan: 1.38,
+        baseSpeedZ: -21.0,
+        flapBase: 9.8,
+        offsets: [
+          { dx: -3.0, dy: 7.0, dz: 12.4, scale: 1.25 },
+          { dx: -1.3, dy: 7.4, dz: 13.8, scale: 1.28 },
+          { dx: 0.6, dy: 7.6, dz: 14.9, scale: 1.22 },
+          { dx: 2.5, dy: 7.3, dz: 16.1, scale: 1.18 },
+          { dx: 4.1, dy: 6.9, dz: 17.4, scale: 1.15 },
+        ],
+      },
+      {
+        // 4. Golden Orioles & Crimson Tanagers — diamond squadron
+        colors: [
+          { body: 0xf59e0b, tip: 0x1e293b, breast: 0xfef08a, beak: 0xf43f5e },
+          { body: 0xe11d48, tip: 0xfda4af, breast: 0xfde047, beak: 0xfbbf24 },
+        ],
+        beakScale: 0.95,
+        wingSpan: 1.08,
+        baseSpeedZ: -26.5,
+        flapBase: 14.8,
+        offsets: [
+          { dx: 0, dy: 6.2, dz: 11.9, scale: 1.06 },
+          { dx: -1.8, dy: 6.6, dz: 13.5, scale: 1.0 },
+          { dx: 1.8, dy: 6.6, dz: 13.5, scale: 1.0 },
+          { dx: -3.1, dy: 7.1, dz: 15.2, scale: 0.94 },
+          { dx: 0, dy: 7.0, dz: 15.4, scale: 1.02 },
+          { dx: 3.1, dy: 7.1, dz: 15.2, scale: 0.94 },
+        ],
+      },
     ];
 
-    flockOffsets.forEach((f, idx) => {
-      const [bodyHex, tipHex] = biomeColors[idx % biomeColors.length];
+    const cfg = speciesConfigs[speciesIdx];
+    cfg.offsets.forEach((f, idx) => {
+      const pal = cfg.colors[idx % cfg.colors.length];
       const { root, leftWingPivot, rightWingPivot } = this.createSkyBirdMesh(
-        bodyHex,
-        tipHex,
-        f.scale
+        pal.body,
+        pal.tip,
+        f.scale,
+        pal.breast,
+        pal.beak,
+        cfg.beakScale,
+        cfg.wingSpan
       );
       const pos = new THREE.Vector3(px + f.dx, py + f.dy, pz + f.dz);
       root.position.copy(pos);
@@ -1590,15 +1874,45 @@ export class LevelPhysicsRuntime {
         vel: new THREE.Vector3(
           Math.sign(f.dx) * 0.42 + (idx % 2 === 0 ? 0.12 : -0.12),
           1.45 + (idx % 3) * 0.18,
-          -25.5 - (idx % 3) * 1.1
+          cfg.baseSpeedZ - (idx % 3) * 1.1
         ),
-        flapSpeed: 13.5 + (idx % 3) * 1.6,
+        flapSpeed: cfg.flapBase + (idx % 3) * 1.5,
         phase: idx * 1.1,
-        life: 4.5,
+        life: 4.8,
       });
     });
 
-    soundEngine.birdFlockFlyover();
+    soundEngine.birdFlockFlyover(speciesIdx);
+  }
+
+  private getCurrentTerrain(): TerrainType {
+    const kind = this.standingPlatform?.spec.kind;
+    if (kind === 'bridge' || kind === 'moving') return 'wood';
+    if (kind === 'ice') return 'ice';
+    if (kind === 'crumbling') return 'dirt';
+    if (this.spec.biome === 'canopy') return 'grass';
+    if (this.spec.biome === 'ruins' || this.spec.biome === 'volcano') return 'stone';
+    return 'dirt';
+  }
+
+  public sampleGroundBelow(x: number, centerY: number, z: number): number | null {
+    this.shadowRayFrom.set(x, centerY - this.playerRadius + 0.14, z);
+    this.shadowRayTo.set(x, centerY - 15.0, z);
+    this.shadowRayResult.reset();
+    this.world.raycastClosest(
+      this.shadowRayFrom,
+      this.shadowRayTo,
+      { skipBackfaces: true, collisionFilterMask: 1 },
+      this.shadowRayResult
+    );
+    if (
+      this.shadowRayResult.hasHit &&
+      this.shadowRayResult.body !== this.playerBody &&
+      this.shadowRayResult.hitNormalWorld.y > 0.45
+    ) {
+      return this.shadowRayResult.hitPointWorld.y;
+    }
+    return null;
   }
 
   public step(
@@ -1613,14 +1927,126 @@ export class LevelPhysicsRuntime {
       onFellInChasm: () => void;
       onBoxHit?: () => void;
       onEnemyDefeated?: () => void;
-    }
+    },
+    rainStrength = 0
   ): { speedHoriz: number; velY: number; strafeVelX: number; footY: number } {
     const clampedDt = Math.min(dt, 0.05);
     this.elapsed += clampedDt;
     this.textures.waterTexture.offset.y -= clampedDt * 0.08;
+
+    const pCurX = this.playerBody.position.x;
+    const pCurZ = this.playerBody.position.z;
+    const pSpeed = Math.hypot(this.playerBody.velocity.x, this.playerBody.velocity.z);
+    const speedFactor = Math.min(1.4, 0.22 + pSpeed / 9.5);
+
+    // Subtle ambient breeze + pass-by spring reactivity on bushes, twigs & monkey tree canopies
     for (const s of this.swayNodes) {
-      s.obj.rotation.z = s.baseRotZ + Math.sin(this.elapsed * s.speed + s.phase) * 0.075;
-      s.obj.rotation.x = s.baseRotX + Math.cos(this.elapsed * s.speed * 0.8 + s.phase) * 0.05;
+      const distSq = (pCurX - s.worldX) * (pCurX - s.worldX) + (pCurZ - s.worldZ) * (pCurZ - s.worldZ);
+      let targetWake = 0;
+      if (distSq < 81) {
+        const dist = Math.sqrt(distSq);
+        targetWake = (1 - dist / 9) * 0.24 * speedFactor;
+      }
+      // Damped spring toward targetWake so foliage parts as player passes and springs smoothly back
+      const force = (targetWake - s.wake) * 42 - s.wakeVel * 8.5;
+      s.wakeVel += force * clampedDt;
+      s.wake += s.wakeVel * clampedDt;
+
+      const breezeZ = Math.sin(this.elapsed * s.speed + s.phase) * s.amp;
+      const breezeX = Math.cos(this.elapsed * s.speed * 0.8 + s.phase) * (s.amp * 0.65);
+      s.obj.rotation.z = s.baseRotZ + breezeZ - s.side * s.wake;
+      s.obj.rotation.x = s.baseRotX + breezeX - Math.abs(s.wake) * 0.55;
+    }
+
+    // Subtle wind & pass-by reactivity on nearby canyon jungle trees & canyon grass/bushes
+    if (this.sceneryTrunks && this.sceneryCanopies) {
+      let updatedTrees = false;
+      const dum = this.swayDummy;
+      for (let i = 0; i < this.sceneryTreeData.length; i++) {
+        const td = this.sceneryTreeData[i];
+        const dz = Math.abs(td.z - pCurZ);
+        if (dz > 28 && Math.abs(td.bend) < 0.002 && Math.abs(td.bendVel) < 0.002) continue;
+
+        let targetBend = 0;
+        if (dz < 14) {
+          const dist = Math.hypot(pCurX - td.x, pCurZ - td.z);
+          if (dist < 18) {
+            targetBend = (1 - dist / 18) * 0.075 * speedFactor;
+          }
+        }
+        const f = (targetBend - td.bend) * 28 - td.bendVel * 6.5;
+        td.bendVel += f * clampedDt;
+        td.bend += td.bendVel * clampedDt;
+
+        const breeze = Math.sin(this.elapsed * 1.35 + td.phase) * 0.022;
+        const swayZ = td.side * -0.08 + breeze - td.side * td.bend;
+        const swayX = Math.cos(this.elapsed * 1.1 + td.phase) * 0.014 - td.bend * 0.55;
+
+        dum.position.set(td.x, td.y + 4.2 * td.scale, td.z);
+        dum.scale.set(td.scale, td.scale, td.scale);
+        dum.rotation.set(swayX, td.rotY, swayZ);
+        dum.updateMatrix();
+        this.sceneryTrunks.setMatrixAt(i, dum.matrix);
+
+        const crownH = 4.4 * td.scale;
+        const leanX = -Math.sin(swayZ - td.side * -0.08) * crownH;
+        const leanZ = Math.sin(swayX) * crownH;
+        dum.position.set(td.x + leanX, td.y + 8.6 * td.scale, td.z + leanZ);
+        dum.scale.set(td.scale * 1.35, td.scale * 0.9, td.scale * 1.35);
+        dum.rotation.set(swayX, i * 0.6, breeze - td.side * td.bend);
+        dum.updateMatrix();
+        this.sceneryCanopies.setMatrixAt(i * 2, dum.matrix);
+
+        dum.position.set(
+          td.x - td.side * 1.4 * td.scale + leanX * 0.85,
+          td.y + 7.5 * td.scale,
+          td.z + 0.8 + leanZ * 0.85
+        );
+        dum.scale.set(td.scale * 1.05, td.scale * 0.75, td.scale * 1.05);
+        dum.updateMatrix();
+        this.sceneryCanopies.setMatrixAt(i * 2 + 1, dum.matrix);
+        updatedTrees = true;
+      }
+      if (updatedTrees) {
+        this.sceneryTrunks.instanceMatrix.needsUpdate = true;
+        this.sceneryCanopies.instanceMatrix.needsUpdate = true;
+      }
+    }
+
+    if (this.sceneryBlades) {
+      let updatedBlades = false;
+      const dum = this.swayDummy;
+      for (let i = 0; i < this.sceneryBladeData.length; i++) {
+        const bd = this.sceneryBladeData[i];
+        const dz = Math.abs(bd.z - pCurZ);
+        if (dz > 22 && Math.abs(bd.bend) < 0.003 && Math.abs(bd.bendVel) < 0.003) continue;
+
+        let targetBend = 0;
+        if (dz < 11) {
+          const dist = Math.hypot(pCurX - bd.x, pCurZ - bd.z);
+          if (dist < 13) {
+            targetBend = (1 - dist / 13) * 0.22 * speedFactor;
+          }
+        }
+        const f = (targetBend - bd.bend) * 38 - bd.bendVel * 8.0;
+        bd.bendVel += f * clampedDt;
+        bd.bend += bd.bendVel * clampedDt;
+
+        const breeze = Math.sin(this.elapsed * 2.1 + bd.phase) * 0.08;
+        dum.position.set(bd.x, bd.y, bd.z);
+        dum.rotation.set(
+          bd.baseRotX - bd.bend * 0.6,
+          bd.baseRotY,
+          bd.baseRotZ + breeze - bd.side * bd.bend
+        );
+        dum.scale.set(1, bd.scaleY, 1);
+        dum.updateMatrix();
+        this.sceneryBlades.setMatrixAt(i, dum.matrix);
+        updatedBlades = true;
+      }
+      if (updatedBlades) {
+        this.sceneryBlades.instanceMatrix.needsUpdate = true;
+      }
     }
     if (this.invulnTimer > 0) this.invulnTimer = Math.max(0, this.invulnTimer - clampedDt);
     if (this.flipAnimTimer > 0) this.flipAnimTimer = Math.max(0, this.flipAnimTimer - clampedDt);
@@ -1688,15 +2114,14 @@ export class LevelPhysicsRuntime {
     let moveX = (input.right ? 1 : 0) - (input.left ? 1 : 0);
     let moveZ = 0;
     if (input.autoRun || input.sprint) {
-      moveZ = -1;
-      if (input.backward) moveZ = input.sprint ? -0.5 : -0.35;
+      moveZ = input.backward ? 0 : -1;
     } else {
-      moveZ = (input.backward ? 1 : 0) - (input.forward ? 1 : 0);
+      moveZ = input.forward ? -1 : 0;
     }
 
     const onIce = this.standingPlatform?.spec.kind === 'ice';
     const accelGround = onIce ? 14 : 44;
-    const accelAir = 22;
+    const accelAir = 30;
     const accel = this.grounded ? accelGround : accelAir;
 
     const targetVx = moveX * maxStrafeSpeed;
@@ -1705,46 +2130,75 @@ export class LevelPhysicsRuntime {
     const blend = Math.min(1, accel * clampedDt * (onIce ? 0.25 : 0.45));
     this.playerBody.velocity.x = THREE.MathUtils.lerp(this.playerBody.velocity.x, targetVx, blend);
     this.playerBody.velocity.z = THREE.MathUtils.lerp(this.playerBody.velocity.z, targetVz, blend);
+    // Character never runs backward (+Z); allow only brief initial hurt-knockback recoil
+    if (this.invulnTimer <= 1.25 && this.playerBody.velocity.z > 0) {
+      this.playerBody.velocity.z = 0;
+    }
 
-    // 3. Jump & Double Jump with Coyote Time & Buffer
+    // 3. Jump & Double Jump with Coyote Time, Buffer & Crisp Fall Gravity
     if (this.jumpBufferTimer > 0) this.jumpBufferTimer -= clampedDt;
     if (this.grounded) {
-      this.coyoteTimer = 0.13;
+      this.coyoteTimer = 0.16;
       this.jumpsUsed = 0;
-    } else if (this.coyoteTimer > 0) {
-      this.coyoteTimer -= clampedDt;
+      this.jumpHoldTimer = 0;
+    } else {
+      if (this.coyoteTimer > 0) this.coyoteTimer -= clampedDt;
+      this.jumpHoldTimer += clampedDt;
     }
 
     if (this.jumpBufferTimer > 0) {
       if (this.coyoteTimer > 0) {
-        this.playerBody.velocity.y = 12.6;
+        this.playerBody.velocity.y = 13.8;
         this.grounded = false;
         this.coyoteTimer = 0;
         this.jumpBufferTimer = 0;
+        this.jumpHoldTimer = 0;
         this.jumpsUsed = 1;
         soundEngine.jump();
         this.spawnBurst(
           new THREE.Vector3(this.playerBody.position.x, this.playerBody.position.y - 0.3, this.playerBody.position.z),
           0xe7e5e4,
-          6
+          7
         );
       } else if (this.jumpsUsed < 2) {
-        this.playerBody.velocity.y = 11.4;
+        this.playerBody.velocity.y = 13.2;
         this.jumpBufferTimer = 0;
         this.jumpsUsed = 2;
-        this.flipAnimTimer = 0.42;
+        this.flipAnimTimer = 0.52;
         soundEngine.doubleJump();
         this.spawnBurst(
-          new THREE.Vector3(this.playerBody.position.x, this.playerBody.position.y - 0.2, this.playerBody.position.z),
+          new THREE.Vector3(this.playerBody.position.x, this.playerBody.position.y - 0.15, this.playerBody.position.z),
           trailColorHex,
-          9
+          12
         );
       }
     }
 
-    // Variable jump cut if player releases jump button mid-ascent
-    if (!input.jumpHeld && this.playerBody.velocity.y > 5.5) {
-      this.playerBody.velocity.y *= 0.88;
+    // Forgiving variable jump release (only after 100ms so quick taps still clear obstacles & hit blocks)
+    if (
+      !input.jumpHeld &&
+      this.jumpsUsed === 1 &&
+      this.jumpHoldTimer > 0.10 &&
+      this.playerBody.velocity.y > 7.8
+    ) {
+      this.playerBody.velocity.y *= 0.94;
+    }
+
+    // Snappy asymmetric fall pull so jumps feel athletic rather than floaty
+    if (!this.grounded && this.playerBody.velocity.y < 0) {
+      this.playerBody.velocity.y -= 11.5 * clampedDt;
+    }
+
+    // One-way Mario block collision: only solid on top when landing from above; never snag front/bottom edges!
+    const preFootY = this.playerBody.position.y - this.playerRadius;
+    const preStepVy = this.playerBody.velocity.y;
+    for (const o of this.obstacles) {
+      if (!o.alive || !o.body) continue;
+      if (o.spec.kind === 'mystery_block' || o.spec.kind === 'coin_box') {
+        const canStandOnTop = preFootY >= o.basePos.y + 0.44 && preStepVy <= 1.0;
+        o.body.collisionResponse = canStandOnTop;
+        o.body.collisionFilterGroup = canStandOnTop ? 1 : 4;
+      }
     }
 
     // 4. Step Cannon-ES Physics World
@@ -1763,7 +2217,12 @@ export class LevelPhysicsRuntime {
       this.playerBody.position.z
     );
     const rayResult = new CANNON.RaycastResult();
-    this.world.raycastClosest(rayFrom, rayTo, { skipBackfaces: true }, rayResult);
+    this.world.raycastClosest(
+      rayFrom,
+      rayTo,
+      { skipBackfaces: true, collisionFilterMask: 1 },
+      rayResult
+    );
 
     this.grounded = false;
     this.standingPlatform = null;
@@ -1778,6 +2237,33 @@ export class LevelPhysicsRuntime {
       }
       this.stompCombo = 0;
     }
+
+    const speedHorizNow = Math.hypot(this.playerBody.velocity.x, this.playerBody.velocity.z);
+    if (this.grounded) {
+      const terrain = this.getCurrentTerrain();
+      if (!this.wasGrounded) {
+        if (this.elapsed > 0.25) {
+          soundEngine.footstep(terrain, 1.25);
+        }
+        this.footstepAcc = 0;
+      } else if (speedHorizNow > 0.85) {
+        const stepInterval = THREE.MathUtils.clamp(
+          Math.PI / (5.4 + speedHorizNow * 0.88),
+          0.19,
+          0.38
+        );
+        this.footstepAcc += clampedDt;
+        if (this.footstepAcc >= stepInterval) {
+          this.footstepAcc -= stepInterval;
+          soundEngine.footstep(terrain, 0.85 + Math.min(0.3, speedHorizNow * 0.02));
+        }
+      } else {
+        this.footstepAcc = 0;
+      }
+    } else {
+      this.footstepAcc = 0;
+    }
+    this.wasGrounded = this.grounded;
 
     // 6. Update Obstacles & Collisions
     const px = this.playerBody.position.x;
@@ -1807,19 +2293,19 @@ export class LevelPhysicsRuntime {
         if (blockMesh) {
           blockMesh.position.y = Math.sin(o.bounceAnim * Math.PI) * 0.35;
         }
-        // Bump from underneath!
+        // Bump from underneath without snagging!
         if (
           !o.used &&
           o.hitCooldown <= 0 &&
-          Math.abs(px - o.basePos.x) < 1.0 &&
-          Math.abs(pz - o.basePos.z) < 1.0 &&
-          py < o.basePos.y - 0.4 &&
-          py > o.basePos.y - 1.45 &&
-          this.playerBody.velocity.y > 0
+          Math.abs(px - o.basePos.x) < 1.12 &&
+          Math.abs(pz - o.basePos.z) < 1.15 &&
+          py < o.basePos.y - 0.15 &&
+          py > o.basePos.y - 1.65 &&
+          (preStepVy > 0.5 || this.playerBody.velocity.y > 0.5)
         ) {
           o.bounceAnim = 1;
           o.hitCooldown = 0.25;
-          this.playerBody.velocity.y = -2;
+          this.playerBody.velocity.y = -2.2;
           soundEngine.mysteryBlock();
           this.spawnBurst(new THREE.Vector3(o.basePos.x, o.basePos.y + 0.8, o.basePos.z), 0xfacc15, 14);
           callbacks.onBoxHit?.();
@@ -2064,9 +2550,8 @@ export class LevelPhysicsRuntime {
         m.headGroup.rotation.x = lookPitch + Math.abs(munch) * 0.14;
         m.headGroup.rotation.y = 0;
 
-        if (m.canThrow && !m.hasThrown && !this.levelMonkeyThrowUsed && nearRange) {
+        if (m.canThrow && !m.hasThrown && nearRange) {
           m.hasThrown = true;
-          this.levelMonkeyThrowUsed = true;
           m.windupTimer = 0.3;
         }
       }
@@ -2246,10 +2731,19 @@ export class LevelPhysicsRuntime {
       }
     }
 
-    // 9b. Trigger & Animate Sky Bird Flock Flyover from behind character (once per level)
-    if (!this.birdFlyoverTriggered && pz < -22) {
-      this.birdFlyoverTriggered = true;
-      this.spawnSkyBirdFlock(px, py, pz);
+    // 9b. Trigger & Loop Sky Bird Flock Flyover from behind character every 20 seconds (changing species each fly)
+    if (!this.birdFlyoverStarted) {
+      if (pz < -22 || this.elapsed >= 20) {
+        this.birdFlyoverStarted = true;
+        this.birdFlyoverTimer = 20;
+        this.spawnSkyBirdFlock(px, py, pz);
+      }
+    } else {
+      this.birdFlyoverTimer -= clampedDt;
+      if (this.birdFlyoverTimer <= 0) {
+        this.birdFlyoverTimer += 20;
+        this.spawnSkyBirdFlock(px, py, pz);
+      }
     }
 
     for (let i = this.skyBirds.length - 1; i >= 0; i--) {
@@ -2278,6 +2772,12 @@ export class LevelPhysicsRuntime {
       }
     }
 
+    this.ambientWildlife.step(clampedDt, px, py, pz, rainStrength, this.elapsed);
+
+    if (this.goalRing) {
+      this.goalRing.rotation.y += clampedDt * 1.4;
+    }
+
     // 10. Check Goal Arch & Chasm Fall
     if (pz <= this.spec.goalZ + 1.5 && Math.abs(px) < 4.5 && Math.abs(footY - this.spec.goalY) < 4.0) {
       soundEngine.levelClear();
@@ -2293,6 +2793,53 @@ export class LevelPhysicsRuntime {
       strafeVelX: this.playerBody.velocity.x,
       footY,
     };
+  }
+
+  public stepIdleAmbient(dt: number, rainStrength = 0) {
+    const clampedDt = Math.min(dt, 0.05);
+    this.elapsed += clampedDt;
+    this.textures.waterTexture.offset.y -= clampedDt * 0.08;
+    this.ambientWildlife.step(clampedDt, 0, -999, 999, rainStrength, this.elapsed);
+  }
+
+  public stepFinishCelebration(dt: number) {
+    const clampedDt = Math.min(dt, 0.05);
+    this.elapsed += clampedDt;
+    this.textures.waterTexture.offset.y -= clampedDt * 0.08;
+    this.ambientWildlife.step(clampedDt, 0, this.spec.goalY, this.spec.goalZ, 0, this.elapsed);
+
+    if (this.goalRing) {
+      this.goalRing.rotation.y += clampedDt * 6.5;
+      const pulse = 1 + Math.sin(this.elapsed * 9) * 0.12;
+      this.goalRing.scale.setScalar(pulse);
+    }
+
+    this.finishFireworkTimer -= clampedDt;
+    if (this.finishFireworkTimer <= 0) {
+      this.finishFireworkTimer = 0.28;
+      const gz = this.spec.goalZ;
+      const gy = this.spec.goalY;
+      this.spawnBurst(new THREE.Vector3(-3.4, gy + 6.4, gz), 0xfbbf24, 10);
+      this.spawnBurst(new THREE.Vector3(3.4, gy + 6.4, gz), 0x34d399, 10);
+      this.spawnBurst(
+        new THREE.Vector3((Math.random() - 0.5) * 3.6, gy + 4.4 + Math.random() * 1.6, gz - 0.4),
+        Math.random() < 0.5 ? 0xfef08a : 0xf97316,
+        12
+      );
+    }
+
+    for (let i = this.particles.length - 1; i >= 0; i--) {
+      const pt = this.particles[i];
+      pt.life -= clampedDt;
+      pt.vel.y -= 14 * clampedDt;
+      pt.mesh.position.addScaledVector(pt.vel, clampedDt);
+      const s = Math.max(0.01, pt.life / pt.maxLife);
+      pt.mesh.scale.setScalar(s);
+      if (pt.life <= 0) {
+        this.levelGroup.remove(pt.mesh);
+        this.particles.splice(i, 1);
+      }
+    }
   }
 
   private handlePlayerHazardHit(hazardPos: THREE.Vector3, onHurt: () => void) {
@@ -2353,6 +2900,7 @@ export class LevelPhysicsRuntime {
   }
 
   public dispose() {
+    this.ambientWildlife.dispose();
     this.coinGeo.dispose();
     this.coinMat.dispose();
     this.particleGeo.dispose();

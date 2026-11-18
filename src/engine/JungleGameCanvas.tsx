@@ -8,8 +8,10 @@ import {
   GamePhase,
   LiveHudState,
   PowerUpType,
+  WeatherMode,
 } from '../types/game';
 import {
+  animateCharacterCelebrate,
   animateCharacterRig,
   buildCharacterRig,
   CharacterRig,
@@ -19,7 +21,9 @@ import {
   InputState,
   LevelPhysicsRuntime,
 } from './levelRuntime';
+import { computeSolarState, DynamicCharacterShadow } from './dynamicShadow';
 import { createProceduralTextures, ProceduralTextureSet } from './textures';
+import { JungleWeatherSystem } from './weatherSystem';
 
 export interface TouchInputBridge {
   left: boolean;
@@ -38,12 +42,14 @@ interface JungleGameCanvasProps {
   phase: GamePhase;
   customization: CharacterCustomization;
   autoRun: boolean;
+  weatherMode: WeatherMode;
   touchBridgeRef: React.MutableRefObject<TouchInputBridge>;
   onHudUpdate: (hud: LiveHudState) => void;
   onSessionCoinsChange: (delta: number) => void;
   onBoxHit?: () => void;
   onEnemyDefeated?: () => void;
   onLevelCleared: (elapsedSeconds: number, sessionCoins: number, livesRemaining: number) => void;
+  onFinishAnimationComplete: () => void;
   onGameOver: () => void;
 }
 
@@ -57,12 +63,14 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
   phase,
   customization,
   autoRun,
+  weatherMode,
   touchBridgeRef,
   onHudUpdate,
   onSessionCoinsChange,
   onBoxHit,
   onEnemyDefeated,
   onLevelCleared,
+  onFinishAnimationComplete,
   onGameOver,
 }) => {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -72,6 +80,8 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
   phaseRef.current = phase;
   const autoRunRef = useRef(autoRun);
   autoRunRef.current = autoRun;
+  const weatherModeRef = useRef(weatherMode);
+  weatherModeRef.current = weatherMode;
   const customRef = useRef(customization);
   customRef.current = customization;
 
@@ -81,6 +91,7 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
     onBoxHit,
     onEnemyDefeated,
     onLevelCleared,
+    onFinishAnimationComplete,
     onGameOver,
   });
   callbacksRef.current = {
@@ -89,6 +100,7 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
     onBoxHit,
     onEnemyDefeated,
     onLevelCleared,
+    onFinishAnimationComplete,
     onGameOver,
   };
 
@@ -105,13 +117,17 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
     textures: ProceduralTextureSet;
     runtime: LevelPhysicsRuntime;
     rig: CharacterRig;
-    contactShadow: THREE.Mesh;
+    weather: JungleWeatherSystem;
+    dynamicShadow: DynamicCharacterShadow;
     sunLight: THREE.DirectionalLight;
     hemiLight: THREE.HemisphereLight;
     lives: number;
     sessionCoins: number;
     levelElapsed: number;
     trailSpawnAcc: number;
+    finishElapsed: number;
+    finishCompleted: boolean;
+    finishStartPos: THREE.Vector3;
     loadLevel: (lvl: number) => void;
     rebuildCharacter: (c: CharacterCustomization) => void;
   } | null>(null);
@@ -235,23 +251,19 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
 
     const textures = createProceduralTextures(renderer);
 
-    // Soft Radial Contact Shadow beneath Explorer
-    const contactShadowGeo = new THREE.PlaneGeometry(1.5, 1.5);
-    contactShadowGeo.rotateX(-Math.PI / 2);
-    const contactShadowMat = new THREE.MeshBasicMaterial({
-      map: textures.contactShadowTexture,
-      transparent: true,
-      depthWrite: false,
-      opacity: 0.52,
-    });
-    const contactShadow = new THREE.Mesh(contactShadowGeo, contactShadowMat);
-    scene.add(contactShadow);
+    // Dynamic Time-of-Day & Weather-Reactive Projected Shadow beneath Explorer
+    const dynamicShadow = new DynamicCharacterShadow();
+    scene.add(dynamicShadow.mesh);
 
     let runtime = new LevelPhysicsRuntime(spec, textures);
     scene.add(runtime.levelGroup);
 
     let rig = buildCharacterRig(customRef.current);
     scene.add(rig.root);
+
+    const weather = new JungleWeatherSystem();
+    weather.resetForLevel(spec.biome, levelNumber, weatherModeRef.current);
+    scene.add(weather.group);
 
     if (!isSoftwareGl) {
       renderer.compile(scene, camera);
@@ -280,9 +292,14 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
       runtime = new LevelPhysicsRuntime(newSpec, textures);
       scene.add(runtime.levelGroup);
       engineRef.current.runtime = runtime;
+      engineRef.current.weather.resetForLevel(newSpec.biome, lvl, weatherModeRef.current);
       engineRef.current.lives = 3;
       engineRef.current.sessionCoins = 0;
       engineRef.current.levelElapsed = 0;
+      engineRef.current.trailSpawnAcc = 0;
+      engineRef.current.finishElapsed = 0;
+      engineRef.current.finishCompleted = false;
+      engineRef.current.finishStartPos.set(0, 1.1, 0);
 
       rig.root.position.set(0, 1.1, 0);
       rig.root.rotation.set(0, 0, 0);
@@ -309,13 +326,17 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
       textures,
       runtime,
       rig,
-      contactShadow,
+      weather,
+      dynamicShadow,
       sunLight,
       hemiLight,
       lives: 3,
       sessionCoins: 0,
       levelElapsed: 0,
       trailSpawnAcc: 0,
+      finishElapsed: 0,
+      finishCompleted: false,
+      finishStartPos: new THREE.Vector3(0, 1.1, 0),
       loadLevel,
       rebuildCharacter,
     };
@@ -452,8 +473,16 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
             }
           },
           onGoal: () => {
-            if (!clearedNow) {
+            if (phaseRef.current === 'playing' && !clearedNow) {
               clearedNow = true;
+              phaseRef.current = 'finishing';
+              eng.finishElapsed = 0;
+              eng.finishCompleted = false;
+              eng.finishStartPos.set(
+                rt.playerBody.position.x,
+                rt.playerBody.position.y - rt.playerRadius,
+                rt.playerBody.position.z
+              );
               callbacksRef.current.onLevelCleared(eng.levelElapsed, eng.sessionCoins, eng.lives);
             }
           },
@@ -472,7 +501,7 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
           onEnemyDefeated: () => {
             callbacksRef.current.onEnemyDefeated?.();
           },
-        });
+        }, eng.weather.rainStrength);
 
         // Sync Rig Position & Orientation
         eng.rig.root.position.set(
@@ -481,9 +510,15 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
           rt.playerBody.position.z
         );
 
-        // Double jump 360 front flip
-        if (rt.flipAnimTimer > 0) {
-          eng.rig.root.rotation.x = -(1 - rt.flipAnimTimer / 0.42) * Math.PI * 2;
+        // Double jump 360 front flip centered around explorer's waist/center of mass
+        const flipProgress = rt.flipAnimTimer > 0 ? 1 - rt.flipAnimTimer / 0.52 : 0;
+        if (flipProgress > 0) {
+          const eased = flipProgress * flipProgress * (3 - 2 * flipProgress);
+          const theta = -eased * Math.PI * 2;
+          const centerY = 0.92;
+          eng.rig.root.rotation.x = theta;
+          eng.rig.root.position.y += centerY * (1 - Math.cos(theta));
+          eng.rig.root.position.z -= centerY * Math.sin(theta);
         } else {
           eng.rig.root.rotation.x = 0;
         }
@@ -502,7 +537,8 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
           totalTime,
           stepInfo.strafeVelX,
           false,
-          rt.activePowerUp === 'blaster'
+          rt.activePowerUp === 'blaster',
+          flipProgress
         );
 
         // Emit Cosmetic Trail Particles while running/jumping
@@ -519,13 +555,7 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
           }
         }
 
-        // Contact shadow tracking
-        eng.contactShadow.position.set(
-          eng.rig.root.position.x,
-          rt.grounded ? stepInfo.footY + 0.03 : stepInfo.footY + 0.03,
-          eng.rig.root.position.z
-        );
-        eng.contactShadow.visible = rt.grounded;
+        // Shadow updated below after weather & solar calculation for all phases
 
         // Smooth Portrait Rear-Chase Mario Camera with subtle speed FOV
         const targetFov = 68 + Math.min(7, stepInfo.speedHoriz * 0.5);
@@ -570,6 +600,7 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
             activePowerUp: rt.activePowerUp,
             powerUpRemaining: rt.powerUpTimer,
             stompCombo: rt.stompCombo,
+            weather: eng.weather.getActiveWeather(),
           });
           const platKind = rt.standingPlatform?.spec.kind;
           soundEngine.updateEnvironment({
@@ -581,7 +612,40 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
               platKind === 'bridge' ||
               platKind === 'ice' ||
               rt.spec.biome === 'waterfall',
+            rainLevel: eng.weather.rainStrength,
           });
+        }
+      } else if (activePhase === 'finishing') {
+        clearAllInputs();
+        eng.finishElapsed += dt;
+        rt.stepFinishCelebration(dt);
+        eng.rig.bodyPivot.visible = true;
+        eng.rig.shieldOrb.visible = false;
+        eng.rig.root.rotation.x = 0;
+
+        // Smoothly guide explorer into temple sanctuary center, then jump & cheer!
+        const moveT = THREE.MathUtils.smoothstep(eng.finishElapsed, 0, 0.45);
+        const hopY = animateCharacterCelebrate(eng.rig, eng.finishElapsed, totalTime);
+        const targetX = THREE.MathUtils.lerp(eng.finishStartPos.x, 0, moveT);
+        const targetZ = THREE.MathUtils.lerp(eng.finishStartPos.z, rt.spec.goalZ - 1.15, moveT);
+        const baseY = THREE.MathUtils.lerp(eng.finishStartPos.y, rt.spec.goalY, moveT);
+        eng.rig.root.position.set(targetX, baseY + hopY, targetZ);
+
+        // Hero celebration camera sweeping to frame explorer + goal temple arch
+        camera.fov = THREE.MathUtils.damp(camera.fov, 60, 4.5, dt);
+        camera.updateProjectionMatrix();
+        _camTargetPos.set(
+          Math.sin(eng.finishElapsed * 0.65) * 2.1,
+          rt.spec.goalY + 2.45,
+          rt.spec.goalZ + 5.75
+        );
+        camera.position.lerp(_camTargetPos, Math.min(1, dt * 3.8));
+        _camLookAt.set(0, rt.spec.goalY + 1.45, rt.spec.goalZ - 0.8);
+        camera.lookAt(_camLookAt);
+
+        if (eng.finishElapsed >= 2.05 && !eng.finishCompleted) {
+          eng.finishCompleted = true;
+          callbacksRef.current.onFinishAnimationComplete();
         }
       } else if (activePhase === 'wardrobe') {
         clearAllInputs();
@@ -607,6 +671,7 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
       } else {
         clearAllInputs();
         // Menu / paused gentle idle camera behind character
+        rt.stepIdleAmbient(dt, eng.weather.rainStrength);
         eng.rig.bodyPivot.visible = true;
         animateCharacterRig(eng.rig, 0, 0, true, totalTime, 0, true);
         _camTargetPos.set(
@@ -623,7 +688,24 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
         camera.lookAt(_camLookAt);
       }
 
-      // Texel-snapped sunlight & soft rim tracking across ALL phases so shadows never swim or cut off ahead
+      // Dynamic Weather (light rain & mist particles + atmosphere tinting)
+      const biomePalette = BIOME_PALETTES[rt.spec.biome];
+      eng.weather.update(
+        dt,
+        weatherModeRef.current,
+        activePhase === 'playing',
+        rt.spec.biome,
+        biomePalette,
+        eng.rig.root.position.x,
+        eng.rig.root.position.y,
+        eng.rig.root.position.z,
+        scene,
+        eng.sunLight,
+        eng.hemiLight
+      );
+
+      // Solar Time-of-Day Angle & Dynamic Projected Shadow (opacity, softness, stretch & altitude falloff)
+      const solar = computeSolarState(rt.spec.biome, rt.spec.levelNumber, eng.levelElapsed);
       const texelSize = (shadowExtent * 2) / shadowMapSize;
       const rawTargetX = eng.rig.root.position.x;
       const rawTargetY = eng.rig.root.position.y;
@@ -634,7 +716,11 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
 
       eng.sunLight.target.position.set(snapX, snapY, snapZ);
       eng.sunLight.target.updateMatrixWorld();
-      eng.sunLight.position.set(snapX + sunOffset.x, snapY + sunOffset.y, snapZ + sunOffset.z);
+      eng.sunLight.position.set(
+        snapX + solar.sunOffset.x,
+        snapY + solar.sunOffset.y,
+        snapZ + solar.sunOffset.z
+      );
 
       rimLight.target.position.copy(eng.rig.root.position);
       rimLight.target.updateMatrixWorld();
@@ -642,6 +728,28 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
         eng.rig.root.position.x - 8,
         eng.rig.root.position.y + 18,
         eng.rig.root.position.z - 18
+      );
+
+      const shadowFootY =
+        activePhase === 'playing'
+          ? rt.playerBody.position.y - rt.playerRadius
+          : eng.rig.root.position.y;
+      const groundHitY = rt.sampleGroundBelow(
+        eng.rig.root.position.x,
+        shadowFootY + rt.playerRadius,
+        eng.rig.root.position.z
+      );
+      eng.dynamicShadow.update(
+        dt,
+        eng.rig.root.position.x,
+        shadowFootY,
+        eng.rig.root.position.z,
+        groundHitY,
+        solar,
+        eng.weather.rainStrength,
+        eng.weather.mistStrength,
+        biomePalette.sunColor,
+        eng.sunLight
       );
 
       renderer.render(scene, camera);
@@ -664,9 +772,9 @@ export const JungleGameCanvas: React.FC<JungleGameCanvasProps> = ({
       renderer.domElement.removeEventListener('webglcontextlost', onContextLost);
       runtime.dispose();
       rig.dispose();
+      weather.dispose();
+      dynamicShadow.dispose();
       textures.dispose();
-      contactShadowGeo.dispose();
-      contactShadowMat.dispose();
       envRT.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode === container) {
