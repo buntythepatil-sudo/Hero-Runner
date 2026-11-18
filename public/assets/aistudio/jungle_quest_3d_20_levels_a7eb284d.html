@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Jungle Quest 3D – 20 Levels</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#10251d;color:#fff;font-family:system-ui,Arial;display:flex;justify-content:center;min-height:100vh}
+.wrap{width:min(100vw,1000px);padding:12px}.top{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+h1{font-size:clamp(20px,4vw,29px);margin:0;color:#ffe27a}.hud{display:flex;gap:12px;font-weight:800;font-size:14px;flex-wrap:wrap}
+.stage{position:relative;border:3px solid #b8e6a2;border-radius:14px;overflow:hidden;background:#79cfe9;box-shadow:0 12px 40px #0008}
+canvas{display:block;width:100%;height:auto;touch-action:none}
+.overlay{position:absolute;inset:0;background:#071a18b9;display:flex;align-items:center;justify-content:center;text-align:center;padding:18px}
+.panel{max-width:470px;background:#163c2b;border:2px solid #c6e88a;border-radius:18px;padding:22px;box-shadow:0 8px 25px #0008}
+.panel h2{color:#ffe27a;margin:0 0 8px}.panel p{line-height:1.45}.panel button,.controls button{border:0;border-radius:12px;background:#ffd34e;color:#38280b;font-weight:900;padding:12px 20px;font-size:16px}
+.controls{display:flex;justify-content:space-between;align-items:center;margin-top:10px;gap:10px;user-select:none}
+.pad{display:flex;gap:10px}.controls button{min-width:64px;min-height:55px;touch-action:none}
+.hint{text-align:center;color:#c6dfcf;font-size:12px;margin-top:8px}
+</style></head><body><div class="wrap">
+<div class="top"><h1>🌴 Jungle Quest 3D</h1><div class="hud"><span id="level">Level 1 / 20</span><span id="coins">🪙 0</span><span id="lives">❤️ 3</span><span id="best">Best: 1</span></div></div>
+<div class="stage"><canvas id="game" width="960" height="600"></canvas><div class="overlay" id="overlay"><div class="panel"><h2>Jungle Quest 3D</h2><p>See the adventure from behind your explorer! Dodge jungle obstacles, jump over logs, collect coins and complete all 20 levels. Every level gets faster and trickier.</p><p><b>Keyboard:</b> ← → or A/D to move · Space / ↑ to jump<br><b>Mobile:</b> Use the buttons below</p><button id="start">Start Level 1</button></div></div></div>
+<div class="controls"><div class="pad"><button id="left">◀ LEFT</button><button id="right">RIGHT ▶</button></div><div class="pad"><button id="jump">JUMP ⤴</button></div></div>
+<div class="hint">Third-person rear camera · 20 progressive levels · Original 3D-style graphics</div>
+</div>
+<script>
+(()=>{
+const canvas=document.getElementById('game'),g=canvas.getContext('2d'),W=960,H=600;
+const $=id=>document.getElementById(id),overlay=$('overlay');
+let level=1,coins=0,lives=3,best=Number(localStorage.getItem('jq3dBest')||1),playing=false,keys={},touch={l:false,r:false};
+let player,objects=[],distance=0,speed=5,levelLength=2200,levelCoins=0,shake=0;
+$('best').textContent='Best: '+best;
+function hud(){$('level').textContent=`Level ${level} / 20`;$('coins').textContent='🪙 '+coins;$('lives').textContent='❤️ '+lives;$('best').textContent='Best: '+best;}
+function makeLevel(){
+ distance=0;levelCoins=0;speed=4.1+level*.34;levelLength=1750+level*100;
+ player={lane:0,target:0,jump:0,jv:0,run:0,inv:0};
+ objects=[];
+ let gap=Math.max(95,190-level*4);
+ for(let z=260;z<levelLength-100;z+=gap+Math.random()*gap*.55){
+   let lane=Math.floor(Math.random()*3)-1;
+   let r=Math.random();
+   let type=r<.52?'log':r<.78?'rock':'coin';
+   objects.push({z,lane,type,hit:false,spin:Math.random()*6});
+   if(type!=='coin'&&Math.random()<.45)objects.push({z:z+35,lane:lane===0?(Math.random()<.5?-1:1):0,type:'coin',hit:false,spin:0});
+ }
+ for(let z=330;z<levelLength-100;z+=330-Math.min(120,level*5)){
+   objects.push({z,lane:Math.floor(Math.random()*3)-1,type:'coin',hit:false,spin:0});
+ }
+ objects.sort((a,b)=>b.z-a.z);
+ hud();
+}
+function start(){playing=true;overlay.style.display='none';makeLevel();}
+$('start').onclick=start;
+function bind(id,prop){let b=$(id);b.addEventListener('pointerdown',e=>{e.preventDefault();if(prop==='jump')doJump();else touch[prop]=true;});['pointerup','pointercancel','pointerleave'].forEach(ev=>b.addEventListener(ev,e=>{e.preventDefault();if(prop!=='jump')touch[prop]=false;}));}
+bind('left','l');bind('right','r');bind('jump','jump');
+window.addEventListener('keydown',e=>{keys[e.code]=true;if(['ArrowLeft','ArrowRight','ArrowUp','Space'].includes(e.code))e.preventDefault();if(!playing&&e.code==='Enter')start();});
+window.addEventListener('keyup',e=>keys[e.code]=false);
+function doJump(){if(playing&&player.jump<=0){player.jv=15.5;}}
+function project(z,lane){let t=Math.max(0,Math.min(1,1-z/1050));let y=175+t*360;let center=W/2;let roadHalf=65+t*310;let x=center+lane*roadHalf*.58;let scale=.22+t*1.55;return {x,y,scale,t,roadHalf};}
+function drawTree(x,y,s,flip=1){
+ g.save();g.translate(x,y);g.scale(s*flip,s);g.fillStyle='#68452b';g.fillRect(-7,-68,14,75);
+ for(let i=0;i<3;i++){g.fillStyle=['#276b3c','#328449','#47984c'][i];g.beginPath();g.arc(0,-77-i*22,35-i*4,0,Math.PI*2);g.fill();}
+ g.restore();
+}
+function draw(){
+ let sky=g.createLinearGradient(0,0,0,H);sky.addColorStop(0,'#6cc7e5');sky.addColorStop(.58,'#b9e6a0');sky.addColorStop(1,'#477b43');g.fillStyle=sky;g.fillRect(0,0,W,H);
+ // distant layered hills
+ g.fillStyle='#79b77c';g.beginPath();g.moveTo(0,270);for(let x=0;x<=W;x+=80)g.lineTo(x,220+Math.sin(x*.012+distance*.0005)*38);g.lineTo(W,H);g.lineTo(0,H);g.fill();
+ // trees create perspective depth, parallax drift
+ for(let i=0;i<17;i++){let z=((i*115-distance*.48)%1900+1900)%1900;let t=1-z/1900;let y=175+t*290;let spread=170+t*480;let s=.24+t*.95;drawTree(W/2-spread-35,y,s,-1);drawTree(W/2+spread+35,y,s,1);}
+ // road trapezoid
+ g.fillStyle='#8b633b';g.beginPath();g.moveTo(420,180);g.lineTo(540,180);g.lineTo(920,600);g.lineTo(40,600);g.closePath();g.fill();
+ g.fillStyle='#bd965e';g.beginPath();g.moveTo(438,180);g.lineTo(522,180);g.lineTo(870,600);g.lineTo(90,600);g.closePath();g.fill();
+ // lane stripes
+ g.strokeStyle='#f4df9b';g.lineWidth=5;g.setLineDash([25,24]);g.beginPath();g.moveTo(460,180);g.lineTo(330,600);g.moveTo(500,180);g.lineTo(630,600);g.stroke();g.setLineDash([]);
+ // roadside grass tufts
+ for(let i=0;i<35;i++){let z=((i*83-distance*.8)%1100+1100)%1100;let t=1-z/1100,y=180+t*420,x=W/2+(i%2?1:-1)*(100+t*390);g.strokeStyle='#2e7d3b';g.lineWidth=2+t*3;g.beginPath();g.moveTo(x,y);g.lineTo(x-7*t,y-12*t);g.moveTo(x,y);g.lineTo(x+8*t,y-15*t);g.stroke();}
+ // objects: far to near
+ objects.forEach(o=>{if(o.hit)return;let p=project(o.z,laneToVisual(o.lane));if(o.z>1050)return;let s=p.scale;g.save();g.translate(p.x,p.y);
+ if(o.type==='coin'){let spin=Math.abs(Math.sin(distance*.018+o.spin));g.scale(.45+spin*.55,1);g.fillStyle='#ffca32';g.beginPath();g.ellipse(0,-24*s,12*s,17*s,0,0,Math.PI*2);g.fill();g.strokeStyle='#fff2a2';g.lineWidth=3*s;g.stroke();}
+ else if(o.type==='log'){g.fillStyle='#704323';g.beginPath();g.roundRect(-27*s,-22*s,54*s,23*s,9*s);g.fill();g.fillStyle='#b57a45';g.beginPath();g.ellipse(25*s,-10*s,6*s,11*s,0,0,Math.PI*2);g.fill();g.fillStyle='#4c2c1b';g.fillRect(-20*s,-18*s,40*s,5*s);}
+ else {g.fillStyle='#777b72';g.beginPath();g.moveTo(-23*s,0);g.lineTo(-18*s,-30*s);g.lineTo(0,-43*s);g.lineTo(24*s,-20*s);g.lineTo(27*s,0);g.closePath();g.fill();g.fillStyle='#aeb4a8';g.beginPath();g.ellipse(-5*s,-28*s,8*s,4*s,-.4,0,Math.PI*2);g.fill();}
+ g.restore();});
+ // player rear-view 3D cartoon explorer
+ drawPlayer();
+ // distance/progress bar
+ g.fillStyle='#153d2c';g.fillRect(18,18,200,10);g.fillStyle='#ffdc57';g.fillRect(18,18,200*Math.min(1,distance/levelLength),10);
+ g.fillStyle='#173526';g.font='bold 14px system-ui';g.fillText('LEVEL '+level+'  •  '+Math.floor(distance)+' m',18,48);
+}
+function laneToVisual(l){return l;}
+function drawPlayer(){
+ let p=player,baseX=W/2+p.lane*145,baseY=515-p.jump*3.4,run=Math.sin(p.run)*5,scale=1;
+ if(p.inv>0&&Math.floor(p.inv/5)%2===0)return;
+ g.save();g.translate(baseX,baseY);g.scale(1,1);
+ // ground shadow
+ g.fillStyle='#1b3c28aa';g.beginPath();g.ellipse(0,5,43-Math.min(25,p.jump*1.4),12-Math.min(7,p.jump*.25),0,0,Math.PI*2);g.fill();
+ // legs with running animation
+ g.strokeStyle='#263b2b';g.lineWidth=15;g.lineCap='round';
+ g.beginPath();g.moveTo(-12,-55);g.lineTo(-17+run,-20);g.lineTo(-23+run,-8);g.stroke();
+ g.beginPath();g.moveTo(12,-55);g.lineTo(17-run,-20);g.lineTo(23-run,-8);g.stroke();
+ // boots
+ g.fillStyle='#49301f';g.beginPath();g.ellipse(-24+run,-7,14,8,-.12,0,Math.PI*2);g.fill();g.beginPath();g.ellipse(24-run,-7,14,8,.12,0,Math.PI*2);g.fill();
+ // backpack
+ g.fillStyle='#b94b2e';g.beginPath();g.roundRect(-27,-116,54,57,13);g.fill();g.fillStyle='#e47b43';g.fillRect(-19,-109,38,8);
+ // torso
+ g.fillStyle='#285c39';g.beginPath();g.roundRect(-30,-126,60,73,17);g.fill();
+ // arms
+ g.strokeStyle='#e7a777';g.lineWidth=13;g.beginPath();g.moveTo(-27,-111);g.lineTo(-39+run,-78);g.stroke();g.beginPath();g.moveTo(27,-111);g.lineTo(39-run,-78);g.stroke();
+ // neck/head rear
+ g.fillStyle='#d99b70';g.fillRect(-10,-140,20,18);
+ g.fillStyle='#d99b70';g.beginPath();g.ellipse(0,-159,25,28,0,0,Math.PI*2);g.fill();
+ // hair and explorer hat
+ g.fillStyle='#39291f';g.beginPath();g.arc(0,-166,25,Math.PI,Math.PI*2);g.fill();g.fillRect(-24,-168,48,13);
+ g.fillStyle='#d5a64b';g.beginPath();g.ellipse(0,-178,32,9,0,0,Math.PI*2);g.fill();g.fillStyle='#986b32';g.fillRect(-18,-190,36,12);
+ // belt
+ g.fillStyle='#e3c16b';g.fillRect(-27,-65,54,6);
+ g.restore();
+}
+function update(){
+ if(!playing)return;
+ let left=keys.ArrowLeft||keys.KeyA||touch.l,right=keys.ArrowRight||keys.KeyD||touch.r;
+ if(left&&!right)player.target=Math.max(-1,player.target-.13);
+ if(right&&!left)player.target=Math.min(1,player.target+.13);
+ player.lane+=(player.target-player.lane)*.22;
+ player.run+=.22+speed*.035;
+ if((keys.Space||keys.ArrowUp||keys.KeyW)&&!keys._jump){doJump();keys._jump=true;}if(!(keys.Space||keys.ArrowUp||keys.KeyW))keys._jump=false;
+ player.jump+=player.jv;player.jv-=.82;if(player.jump<0){player.jump=0;player.jv=0;}
+ if(player.inv>0)player.inv--;
+ distance+=speed;
+ // collision window; obstacles move toward camera. lane match with forgiving tolerance
+ objects.forEach(o=>{if(o.hit)return;o.z-=speed;if(o.z<24&&o.z>-16){if(Math.abs(player.lane-o.lane)<.48){if(o.type==='coin'){coins++;levelCoins++;o.hit=true;}else if(player.jump<22&&player.inv<=0){lives--;player.inv=85;o.hit=true;hud();if(lives<=0)finish(false);}}else if(o.type==='coin'&&o.z<-15)o.hit=true;}});
+ if(distance>=levelLength){if(level===20){finish(true);}else{level++;best=Math.max(best,level);localStorage.setItem('jq3dBest',best);overlay.style.display='flex';overlay.innerHTML=`<div class="panel"><h2>Level ${level-1} Complete! ⭐</h2><p>Coins collected: ${levelCoins}<br>Next level difficulty increases: faster running and more obstacles.</p><button id="next">Start Level ${level}</button></div>`;playing=false;$('next').onclick=()=>{overlay.style.display='none';playing=true;makeLevel();};hud();}}
+ hud();
+}
+function finish(win){playing=false;overlay.style.display='flex';overlay.innerHTML=`<div class="panel"><h2>${win?'🏆 You conquered all 20 levels!':'Adventure Over'}</h2><p>${win?'Amazing! You are the Jungle Quest champion.':'You reached level '+level+'. Keep practicing!'}</p><p>Total coins: ${coins}</p><button id="again">Play Again</button></div>`;$('again').onclick=()=>{level=1;coins=0;lives=3;start();};}
+function frame(){update();draw();requestAnimationFrame(frame);}
+frame();hud();
+})();
+</script></body></html>

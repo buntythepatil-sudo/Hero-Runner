@@ -1,0 +1,6 @@
+{
+  "name": "Jungle Quest 3D",
+  "description": "A 3D rear-view Mario-style jungle platformer with realistic rigid-body physics, 20 progressive levels, customizable male and female explorers, and 40+ unlockable cosmetic items.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
