@@ -3,13 +3,104 @@ import * as THREE from 'three';
 import { soundEngine, TerrainType } from '../audio/soundEngine';
 import {
   BiomeType,
+  GraphicsQuality,
   LevelSpec,
   ObstacleSpec,
   PlatformSegmentSpec,
   PowerUpType,
+  SwingVineSpec,
+  WeatherKind,
+  WeatherMode,
 } from '../types/game';
 import { AmbientWildlifeSystem, WildlifeAnchor } from './ambientWildlife';
+import { buildLangoorModel, LangoorPetRig } from './characterBuilder';
+import { ObstacleShadowCaster } from './dynamicShadow';
+import { applyFoliageWindShader, FoliageWindController } from './foliageWind';
+import { SurpriseAnimalDirector } from './surpriseAnimal';
 import { ProceduralTextureSet } from './textures';
+
+/**
+ * Builds a single merged multi-plane botanical leaf-cluster geometry (3 crossed angled leaf cards
+ * + a gently domed top canopy crown) so every instanced tree crown shows crisp individual jungle leaves
+ * from every camera angle in 1 draw call.
+ */
+function createLeafClusterGeometry(radius: number): THREE.BufferGeometry {
+  const planes: THREE.PlaneGeometry[] = [];
+  const angles = [0, Math.PI / 3, (Math.PI * 2) / 3];
+  for (let i = 0; i < angles.length; i++) {
+    const p = new THREE.PlaneGeometry(radius * 2.1, radius * 1.45, 2, 2);
+    const pos = p.attributes.position;
+    for (let k = 0; k < pos.count; k++) {
+      const x = pos.getX(k);
+      const y = pos.getY(k);
+      // Slight natural convex droop outward so leaves feel volumetric, never flat
+      const rNorm = Math.min(1, Math.hypot(x / (radius * 1.05), y / (radius * 0.75)));
+      pos.setZ(k, (1 - rNorm * rNorm) * radius * 0.24);
+    }
+    p.rotateX(0.18 * (i % 2 === 0 ? 1 : -1));
+    p.rotateY(angles[i]);
+    p.computeVertexNormals();
+    planes.push(p);
+  }
+  // Overhead horizontal sunlit leaf crown layer
+  const cap = new THREE.PlaneGeometry(radius * 2.15, radius * 2.15, 2, 2);
+  cap.rotateX(-Math.PI / 2);
+  const cPos = cap.attributes.position;
+  for (let k = 0; k < cPos.count; k++) {
+    const x = cPos.getX(k);
+    const z = cPos.getZ(k);
+    const d = Math.min(1, Math.hypot(x, z) / (radius * 1.25));
+    cPos.setY(k, radius * 0.26 - d * d * radius * 0.36);
+  }
+  cap.computeVertexNormals();
+  planes.push(cap);
+
+  let totalVerts = 0;
+  let totalIdx = 0;
+  for (const g of planes) {
+    totalVerts += g.attributes.position.count;
+    totalIdx += g.index ? g.index.count : g.attributes.position.count;
+  }
+
+  const positions = new Float32Array(totalVerts * 3);
+  const normals = new Float32Array(totalVerts * 3);
+  const uvs = new Float32Array(totalVerts * 2);
+  const indices = new Uint32Array(totalIdx);
+
+  let vOffset = 0;
+  let iOffset = 0;
+  for (const g of planes) {
+    const pAttr = g.attributes.position;
+    const nAttr = g.attributes.normal;
+    const uAttr = g.attributes.uv;
+    for (let v = 0; v < pAttr.count; v++) {
+      positions[(vOffset + v) * 3] = pAttr.getX(v);
+      positions[(vOffset + v) * 3 + 1] = pAttr.getY(v);
+      positions[(vOffset + v) * 3 + 2] = pAttr.getZ(v);
+      normals[(vOffset + v) * 3] = nAttr.getX(v);
+      normals[(vOffset + v) * 3 + 1] = nAttr.getY(v);
+      normals[(vOffset + v) * 3 + 2] = nAttr.getZ(v);
+      uvs[(vOffset + v) * 2] = uAttr.getX(v);
+      uvs[(vOffset + v) * 2 + 1] = uAttr.getY(v);
+    }
+    if (g.index) {
+      for (let idx = 0; idx < g.index.count; idx++) {
+        indices[iOffset + idx] = g.index.getX(idx) + vOffset;
+      }
+      iOffset += g.index.count;
+    }
+    vOffset += pAttr.count;
+    g.dispose();
+  }
+
+  const merged = new THREE.BufferGeometry();
+  merged.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  merged.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+  merged.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  merged.setIndex(new THREE.BufferAttribute(indices, 1));
+  merged.computeBoundingSphere();
+  return merged;
+}
 
 export interface BiomePalette {
   skyHex: number;
@@ -92,6 +183,7 @@ export interface RuntimeObstacle {
   alive: boolean;
   used?: boolean;
   hitsLeft?: number;
+  extraLifeChecked?: boolean;
   bounceAnim: number;
   hitCooldown: number;
   basePos: THREE.Vector3;
@@ -125,6 +217,10 @@ export interface ParticleBurst {
   vel: THREE.Vector3;
   life: number;
   maxLife: number;
+  baseScale?: number;
+  gravity?: number;
+  baseOpacity?: number;
+  disposeMat?: boolean;
 }
 
 export interface JungleMonkey {
@@ -139,6 +235,8 @@ export interface JungleMonkey {
   throwCooldown: number;
   windupTimer: number;
   phase: number;
+  audioId: string;
+  passByChattered: boolean;
 }
 
 export interface ThrownBanana {
@@ -167,8 +265,56 @@ export interface InputState {
   sprint: boolean;
   jumpPressed: boolean;
   jumpHeld: boolean;
+  laneLeftPressed: boolean;
+  laneRightPressed: boolean;
   firePressed: boolean;
   autoRun: boolean;
+}
+
+export interface RuntimeVine {
+  spec: SwingVineSpec;
+  anchorGroup: THREE.Group;
+  vinePivot: THREE.Group;
+  glowRing: THREE.Mesh;
+  angle: number;
+  angVel: number;
+}
+
+export interface FallingLeafData {
+  x: number;
+  y: number;
+  z: number;
+  vx: number;
+  vy: number;
+  vz: number;
+  rotX: number;
+  rotY: number;
+  rotZ: number;
+  spin: number;
+  phase: number;
+  scale: number;
+}
+
+export interface StepResult {
+  speedHoriz: number;
+  velY: number;
+  strafeVelX: number;
+  footY: number;
+  lane: -1 | 0 | 1;
+  laneSwitchDir: -1 | 0 | 1;
+  laneSwitchProgress: number;
+  isSliding: boolean;
+  slideProgress: number;
+  jumpAnticipation: number;
+  landingTimer: number;
+  landingImpact: number;
+  stumbleTimer: number;
+  stumbleDir: number;
+  isSwinging: boolean;
+  vineAngle: number;
+  vineAngVel: number;
+  hasLangoorPet: boolean;
+  langoorCheerTimer: number;
 }
 
 export class LevelPhysicsRuntime {
@@ -198,9 +344,46 @@ export class LevelPhysicsRuntime {
   public boulderSpawnTimer = 1.2;
   public fireCooldown = 0;
 
+  // Temple Run-style 3-lane, slide, jump/landing & stumble kinematics state
+  public currentLane: -1 | 0 | 1 = 0;
+  public laneModeActive = true;
+  public laneSwitchDir: -1 | 0 | 1 = 0;
+  public laneSwitchTimer = 0;
+  private readonly laneSwitchDuration = 0.24;
+  private holdStrafeTimer = 0;
+  private prevInputLeft = false;
+  private prevInputRight = false;
+
+  public slideTimer = 0;
+  private readonly slideDuration = 0.68;
+  private pendingAirSlide = false;
+  private slideDustAcc = 0;
+
+  public jumpAnticipationTimer = 0;
+  public landingTimer = 0;
+  public landingImpact = 0;
+  public stumbleTimer = 0;
+  public stumbleDir = 1;
+  private prevAirVelY = 0;
+
   public activePowerUp: PowerUpType | null = null;
   public powerUpTimer = 0;
   public stompCombo = 0;
+  public vines: RuntimeVine[] = [];
+  public activeVine: RuntimeVine | null = null;
+  private vineReleaseCooldown = 0;
+  private vineLateralX = 0;
+  private fallingLeavesMesh: THREE.InstancedMesh | null = null;
+  private fallingLeavesData: FallingLeafData[] = [];
+  public hasLangoorPet = false;
+  public langoorCheerTimer = 0;
+  public extraLifeNoticeTimer = 0;
+  private leapingLangoor: {
+    rig: LangoorPetRig;
+    startPos: THREE.Vector3;
+    elapsed: number;
+    duration: number;
+  } | null = null;
 
   private defaultPhysMat: CANNON.Material;
   private icePhysMat: CANNON.Material;
@@ -228,6 +411,10 @@ export class LevelPhysicsRuntime {
   private sceneryTrunks: THREE.InstancedMesh | null = null;
   private sceneryCanopies: THREE.InstancedMesh | null = null;
   private sceneryBlades: THREE.InstancedMesh | null = null;
+  private sceneryFerns: THREE.InstancedMesh | null = null;
+  private canopyClustersPerTree = 4;
+  public foliageWind = new FoliageWindController();
+  private graphicsQuality: GraphicsQuality = 'high';
   private sceneryTreeData: {
     x: number;
     y: number;
@@ -252,6 +439,19 @@ export class LevelPhysicsRuntime {
     bendVel: number;
     phase: number;
   }[] = [];
+  private sceneryFernData: {
+    x: number;
+    y: number;
+    z: number;
+    scale: number;
+    side: number;
+    baseRotX: number;
+    baseRotY: number;
+    baseRotZ: number;
+    bend: number;
+    bendVel: number;
+    phase: number;
+  }[] = [];
   private swayDummy = new THREE.Object3D();
   private shadowRayFrom = new CANNON.Vec3();
   private shadowRayTo = new CANNON.Vec3();
@@ -268,10 +468,17 @@ export class LevelPhysicsRuntime {
   private finishFireworkTimer = 0;
   private wildlifeAnchors: WildlifeAnchor[] = [];
   private ambientWildlife: AmbientWildlifeSystem;
+  public surpriseAnimal: SurpriseAnimalDirector;
 
-  constructor(spec: LevelSpec, textures: ProceduralTextureSet) {
+  constructor(
+    spec: LevelSpec,
+    textures: ProceduralTextureSet,
+    graphicsQuality: GraphicsQuality = 'high'
+  ) {
     this.spec = spec;
     this.textures = textures;
+    this.graphicsQuality = graphicsQuality;
+    this.canopyClustersPerTree = graphicsQuality === 'low' ? 3 : 4;
     this.levelGroup = new THREE.Group();
 
     this.world = new CANNON.World({
@@ -324,6 +531,8 @@ export class LevelPhysicsRuntime {
     this.buildPlatforms();
     this.buildMonkeyTrees();
     this.buildObstacles();
+    this.buildVines();
+    this.buildFallingLeaves();
     this.buildCoins();
     this.buildGoalTemple();
 
@@ -335,6 +544,11 @@ export class LevelPhysicsRuntime {
       this.spec.goalY
     );
     this.levelGroup.add(this.ambientWildlife.group);
+    this.surpriseAnimal = new SurpriseAnimalDirector(
+      this.spec.levelNumber,
+      this.spec.length,
+      this.levelGroup
+    );
   }
 
   private buildScenery() {
@@ -419,41 +633,57 @@ export class LevelPhysicsRuntime {
     arches.computeBoundingSphere();
     this.levelGroup.add(arches);
 
-    // 5. Realistic Curved Jungle Canopy Trees with Multi-Tier Lush Foliage
-    const treeCount = Math.max(96, Math.round(this.spec.length * 0.48));
+    // 5. Realistic Curved Jungle Canopy Trees with Multi-Cluster Overlapping Foliage
+    const densityMult =
+      this.graphicsQuality === 'low' ? 0.56 : this.graphicsQuality === 'medium' ? 0.8 : 1.0;
+    const treeCount = Math.max(60, Math.round(Math.max(106, this.spec.length * 0.52) * densityMult));
+    const clustersPerTree = this.canopyClustersPerTree;
+
     const trunkCurve = new THREE.CatmullRomCurve3([
       new THREE.Vector3(0, -4.5, 0),
-      new THREE.Vector3(0.35, -1.5, 0.15),
-      new THREE.Vector3(-0.22, 1.8, -0.1),
-      new THREE.Vector3(0.18, 4.8, 0.2),
+      new THREE.Vector3(0.38, -1.5, 0.16),
+      new THREE.Vector3(-0.24, 1.8, -0.12),
+      new THREE.Vector3(0.22, 4.9, 0.22),
     ]);
-    const trunkGeo = new THREE.TubeGeometry(trunkCurve, 10, 0.48, 8, false);
-    const trunkMat = new THREE.MeshStandardMaterial({
-      color: palette.treeTrunkHex,
-      bumpMap: this.textures.barkBumpTexture,
-      bumpScale: 0.12,
-      roughness: 0.9,
-      metalness: 0.02,
-    });
-    const canopyGeo = new THREE.DodecahedronGeometry(2.8, 1);
-    canopyGeo.scale(1.25, 0.56, 1.15);
-    const canopyMat = new THREE.MeshStandardMaterial({
-      color: palette.treeLeafHex,
-      roughness: 0.72,
-      metalness: 0.04,
-    });
+    const trunkGeo = new THREE.TubeGeometry(trunkCurve, 10, 0.52, 8, false);
+    const trunkMat = applyFoliageWindShader(
+      new THREE.MeshStandardMaterial({
+        color: palette.treeTrunkHex,
+        map: this.textures.branchTextures[this.spec.biome],
+        bumpMap: this.textures.barkBumpTexture,
+        bumpScale: 0.16,
+        roughness: 0.9,
+        metalness: 0.02,
+      }),
+      this.foliageWind.uniforms,
+      'trunk'
+    );
+    const canopyGeo = createLeafClusterGeometry(3.35);
+    const canopyMat = applyFoliageWindShader(
+      new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        map: this.textures.canopyLeafClusterTexture,
+        alphaTest: 0.36,
+        roughness: 0.64,
+        metalness: 0.02,
+        side: THREE.DoubleSide,
+      }),
+      this.foliageWind.uniforms,
+      'canopy'
+    );
 
     const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, treeCount);
-    const canopies = new THREE.InstancedMesh(canopyGeo, canopyMat, treeCount * 2);
+    const canopies = new THREE.InstancedMesh(canopyGeo, canopyMat, treeCount * clustersPerTree);
     const tint = new THREE.Color();
+    const clusterTint = new THREE.Color();
     this.sceneryTreeData = [];
 
     for (let i = 0; i < treeCount; i++) {
       const side = i % 2 === 0 ? -1 : 1;
-      const zPos = 14 - (i / treeCount) * (this.spec.length + 60);
-      const xPos = side * (10.5 + ((i * 31) % 14));
+      const zPos = 14 - (i / treeCount) * (this.spec.length + 65);
+      const xPos = side * (9.8 + ((i * 31) % 15));
       const yPos = -6.0 + ((i * 17) % 6);
-      const scale = 0.92 + ((i * 13) % 40) / 100;
+      const scale = 0.92 + ((i * 13) % 44) / 100;
       const rotY = (i * 1.1) % Math.PI;
 
       this.sceneryTreeData.push({
@@ -474,20 +704,48 @@ export class LevelPhysicsRuntime {
       dummy.updateMatrix();
       trunks.setMatrixAt(i, dummy.matrix);
 
-      dummy.position.set(xPos, yPos + 8.6 * scale, zPos);
-      dummy.scale.set(scale * 1.35, scale * 0.9, scale * 1.35);
+      const baseIdx = i * clustersPerTree;
+      // Rich natural green variations across sunlit, emerald, and deep shade foliage
+      tint
+        .setHex(palette.treeLeafHex)
+        .offsetHSL(((i % 9) - 4) * 0.014, 0.08 + (i % 3) * 0.04, ((i % 5) - 2) * 0.045);
+
+      // Cluster 0: Broad primary overlapping crown
+      dummy.position.set(xPos, yPos + 8.7 * scale, zPos);
+      dummy.scale.set(scale * 1.44, scale * 0.92, scale * 1.44);
       dummy.rotation.set(0, i * 0.6, 0);
       dummy.updateMatrix();
-      canopies.setMatrixAt(i * 2, dummy.matrix);
+      canopies.setMatrixAt(baseIdx, dummy.matrix);
+      canopies.setColorAt(baseIdx, tint);
 
-      dummy.position.set(xPos - side * 1.4 * scale, yPos + 7.5 * scale, zPos + 0.8);
-      dummy.scale.set(scale * 1.05, scale * 0.75, scale * 1.05);
+      // Cluster 1: Overhanging canyon-side sunlit bough cluster
+      dummy.position.set(xPos - side * 1.65 * scale, yPos + 7.7 * scale, zPos + 0.85);
+      dummy.scale.set(scale * 1.14, scale * 0.76, scale * 1.12);
+      dummy.rotation.set(0.08, i * 0.9 + 1.1, side * 0.12);
       dummy.updateMatrix();
-      canopies.setMatrixAt(i * 2 + 1, dummy.matrix);
+      canopies.setMatrixAt(baseIdx + 1, dummy.matrix);
+      clusterTint.copy(tint).offsetHSL(0.025, 0.07, 0.06);
+      canopies.setColorAt(baseIdx + 1, clusterTint);
 
-      tint.setHex(palette.treeLeafHex).offsetHSL(((i % 7) - 3) * 0.015, 0.08, ((i % 4) - 1) * 0.05);
-      canopies.setColorAt(i * 2, tint);
-      canopies.setColorAt(i * 2 + 1, tint.clone().offsetHSL(0.02, 0.05, 0.04));
+      // Cluster 2: Upper sunlit canopy puff catching golden sunlight
+      dummy.position.set(xPos + side * 1.15 * scale, yPos + 9.45 * scale, zPos - 0.95);
+      dummy.scale.set(scale * 1.06, scale * 0.74, scale * 1.08);
+      dummy.rotation.set(-0.06, i * 1.3 + 2.2, -side * 0.08);
+      dummy.updateMatrix();
+      canopies.setMatrixAt(baseIdx + 2, dummy.matrix);
+      clusterTint.copy(tint).offsetHSL(0.035, 0.09, 0.09);
+      canopies.setColorAt(baseIdx + 2, clusterTint);
+
+      if (clustersPerTree >= 4) {
+        // Cluster 3: Deep shaded understory foliage shelf for lush vertical overlap
+        dummy.position.set(xPos - side * 0.8 * scale, yPos + 6.7 * scale, zPos - 1.35);
+        dummy.scale.set(scale * 0.98, scale * 0.64, scale * 1.04);
+        dummy.rotation.set(0.05, i * 1.7 + 0.4, side * 0.06);
+        dummy.updateMatrix();
+        canopies.setMatrixAt(baseIdx + 3, dummy.matrix);
+        clusterTint.copy(tint).offsetHSL(-0.022, 0.05, -0.075);
+        canopies.setColorAt(baseIdx + 3, clusterTint);
+      }
     }
 
     trunks.computeBoundingSphere();
@@ -496,24 +754,29 @@ export class LevelPhysicsRuntime {
     this.sceneryCanopies = canopies;
     this.levelGroup.add(trunks, canopies);
 
-    // 6. Lush Sharp Jungle Grass / Fern Blades sprouting along the canyon ledges
-    const grassCount = Math.max(220, Math.round(this.spec.length * 1.1));
-    const bladeGeo = new THREE.ConeGeometry(0.18, 1.75, 4);
-    const bladeMat = new THREE.MeshStandardMaterial({
-      color: isVolcano ? 0x6b4f3a : 0x76b82a,
-      roughness: 0.7,
-    });
+    // 6. Lush Sharp Jungle Grass Blades sprouting along the canyon ledges (varied greens)
+    const grassCount = Math.max(140, Math.round(Math.max(250, this.spec.length * 1.25) * densityMult));
+    const bladeGeo = new THREE.ConeGeometry(0.19, 1.85, 4);
+    const bladeMat = applyFoliageWindShader(
+      new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        roughness: 0.68,
+        metalness: 0.02,
+      }),
+      this.foliageWind.uniforms,
+      'grass'
+    );
     const blades = new THREE.InstancedMesh(bladeGeo, bladeMat, grassCount);
     this.sceneryBladeData = [];
     for (let i = 0; i < grassCount; i++) {
       const side = i % 2 === 0 ? -1 : 1;
       const zPos = 8 - (i / grassCount) * (this.spec.length + 45);
-      const xPos = side * (6.4 + ((i * 19) % 7));
+      const xPos = side * (6.2 + ((i * 19) % 7));
       const yPos = -1.6 + ((i * 11) % 3);
       const baseRotX = ((i % 5) - 2) * 0.14;
       const baseRotY = i * 0.9;
       const baseRotZ = side * 0.3;
-      const scaleY = 0.85 + (i % 4) * 0.3;
+      const scaleY = 0.85 + (i % 4) * 0.32;
       this.sceneryBladeData.push({
         x: xPos,
         y: yPos,
@@ -532,10 +795,122 @@ export class LevelPhysicsRuntime {
       dummy.scale.set(1, scaleY, 1);
       dummy.updateMatrix();
       blades.setMatrixAt(i, dummy.matrix);
+
+      tint
+        .setHex(isVolcano ? 0x6b4f3a : 0x6cb82a)
+        .offsetHSL(((i % 7) - 3) * 0.018, 0.05, ((i % 5) - 2) * 0.055);
+      blades.setColorAt(i, tint);
     }
     blades.computeBoundingSphere();
     this.sceneryBlades = blades;
     this.levelGroup.add(blades);
+
+    // 7. Broadleaf Tropical Ferns & Real Feathered Palm Fronds along Gorge Edges
+    const fernClumps = Math.max(56, Math.round(Math.max(96, this.spec.length * 0.48) * densityMult));
+    const frondsPerClump = this.graphicsQuality === 'low' ? 3 : 4;
+    const fernCount = fernClumps * frondsPerClump;
+    const fernGeo = new THREE.PlaneGeometry(1.55, 2.55, 2, 5);
+    // Arch the tropical palm frond outward & upward organically with graceful tip droop
+    const fPos = fernGeo.attributes.position;
+    for (let k = 0; k < fPos.count; k++) {
+      const fy = fPos.getY(k); // -1.275 .. +1.275
+      const t = THREE.MathUtils.clamp((fy + 1.275) / 2.55, 0, 1);
+      const fx = fPos.getX(k);
+      const archY = Math.sin(t * Math.PI * 0.68) * 2.15;
+      fPos.setX(k, fx);
+      fPos.setY(k, archY);
+      fPos.setZ(k, Math.pow(t, 1.45) * 1.45);
+    }
+    fPos.needsUpdate = true;
+    fernGeo.computeVertexNormals();
+    fernGeo.computeBoundingSphere();
+    const fernMat = applyFoliageWindShader(
+      new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        map: this.textures.palmFrondTexture,
+        alphaTest: 0.34,
+        roughness: 0.58,
+        metalness: 0.03,
+        side: THREE.DoubleSide,
+      }),
+      this.foliageWind.uniforms,
+      'fern'
+    );
+    const ferns = new THREE.InstancedMesh(fernGeo, fernMat, fernCount);
+    this.sceneryFernData = [];
+    for (let cIdx = 0; cIdx < fernClumps; cIdx++) {
+      const side = cIdx % 2 === 0 ? -1 : 1;
+      const cz = 10 - (cIdx / fernClumps) * (this.spec.length + 46);
+      const cx = side * (6.4 + ((cIdx * 23) % 6));
+      const cy = -2.0 + ((cIdx * 13) % 3) * 0.7;
+      const scale = 0.92 + (cIdx % 4) * 0.24;
+
+      for (let f = 0; f < frondsPerClump; f++) {
+        const instIdx = cIdx * frondsPerClump + f;
+        const baseRotY = cIdx * 0.7 + (f / frondsPerClump) * Math.PI * 2;
+        const baseRotX = 0.22 + (f % 2) * 0.14;
+        const baseRotZ = side * 0.2;
+        this.sceneryFernData.push({
+          x: cx,
+          y: cy,
+          z: cz,
+          scale,
+          side,
+          baseRotX,
+          baseRotY,
+          baseRotZ,
+          bend: 0,
+          bendVel: 0,
+          phase: cIdx * 0.67 + f * 0.9,
+        });
+        dummy.position.set(cx, cy, cz);
+        dummy.rotation.set(baseRotX, baseRotY, baseRotZ);
+        dummy.scale.setScalar(scale);
+        dummy.updateMatrix();
+        ferns.setMatrixAt(instIdx, dummy.matrix);
+
+        tint
+          .setHex(isVolcano ? 0x735238 : 0x86cf48)
+          .offsetHSL(((cIdx + f) % 5 - 2) * 0.015, 0.06, (f - 1) * 0.045);
+        ferns.setColorAt(instIdx, tint);
+      }
+    }
+    ferns.computeBoundingSphere();
+    this.sceneryFerns = ferns;
+    this.levelGroup.add(ferns);
+
+    // 8. Weathered Mossy Gorge Rocks & Cliff Boulders for Terrain Depth
+    const rockCount = Math.max(36, Math.round(Math.max(64, this.spec.length * 0.32) * densityMult));
+    const rockGeo = new THREE.DodecahedronGeometry(1.45, 1);
+    rockGeo.scale(1.25, 0.78, 1.1);
+    const rockMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: this.textures.stoneTexture,
+      bumpMap: this.textures.stoneBumpTexture,
+      bumpScale: 0.16,
+      roughness: 0.88,
+      metalness: 0.05,
+    });
+    const rocks = new THREE.InstancedMesh(rockGeo, rockMat, rockCount);
+    for (let i = 0; i < rockCount; i++) {
+      const side = i % 2 === 0 ? -1 : 1;
+      const rz = 6 - (i / rockCount) * (this.spec.length + 52);
+      const rx = side * (7.2 + ((i * 29) % 8));
+      const ry = -3.4 + ((i * 17) % 4) * 0.85;
+      const rs = 0.75 + (i % 5) * 0.28;
+      dummy.position.set(rx, ry, rz);
+      dummy.rotation.set(i * 0.5, i * 1.1, i * 0.35);
+      dummy.scale.set(rs * 1.1, rs * 0.85, rs);
+      dummy.updateMatrix();
+      rocks.setMatrixAt(i, dummy.matrix);
+
+      tint
+        .setHex(palette.cliffHex)
+        .offsetHSL(((i % 5) - 2) * 0.01, 0.04, 0.14 + (i % 4) * 0.05);
+      rocks.setColorAt(i, tint);
+    }
+    rocks.computeBoundingSphere();
+    this.levelGroup.add(rocks);
   }
 
   // Straight, level plain road surface (zero uneven wave or lateral wobble)
@@ -742,11 +1117,48 @@ export class LevelPhysicsRuntime {
           bumpScale: 0.12,
           roughness: 0.88,
         });
-        const leafMat = new THREE.MeshStandardMaterial({
-          color: p.kind === 'crumbling' ? 0xb45309 : palette.treeLeafHex,
-          roughness: 0.62,
-          side: THREE.DoubleSide,
-        });
+        const leafMat = applyFoliageWindShader(
+          new THREE.MeshStandardMaterial({
+            color: p.kind === 'crumbling' ? 0xc27828 : 0x9ce066,
+            map: this.textures.palmFrondTexture,
+            alphaTest: 0.34,
+            roughness: 0.56,
+            side: THREE.DoubleSide,
+          }),
+          this.foliageWind.uniforms,
+          'fern'
+        );
+        const bushLeafMat = applyFoliageWindShader(
+          new THREE.MeshStandardMaterial({
+            color: p.kind === 'crumbling' ? 0xb45309 : 0x8ad458,
+            map: this.textures.canopyLeafClusterTexture,
+            alphaTest: 0.36,
+            roughness: 0.6,
+            side: THREE.DoubleSide,
+          }),
+          this.foliageWind.uniforms,
+          'bush'
+        );
+        const tendrilMat = applyFoliageWindShader(
+          new THREE.MeshStandardMaterial({
+            color: palette.treeLeafHex,
+            roughness: 0.72,
+          }),
+          this.foliageWind.uniforms,
+          'vine'
+        );
+        const sideFrondGeo = new THREE.PlaneGeometry(1.15, 2.05, 1, 3);
+        const sfPos = sideFrondGeo.attributes.position;
+        for (let k = 0; k < sfPos.count; k++) {
+          const t = THREE.MathUtils.clamp((sfPos.getY(k) + 1.025) / 2.05, 0, 1);
+          sfPos.setY(k, t * 1.95);
+          sfPos.setZ(k, Math.pow(t, 1.5) * 0.65);
+        }
+        sfPos.needsUpdate = true;
+        sideFrondGeo.computeVertexNormals();
+        sideFrondGeo.computeBoundingSphere();
+        const bushSprigGeo = createLeafClusterGeometry(0.62);
+
         const twigCount = Math.max(3, Math.floor(p.depth / 3.8));
         for (let t = 0; t < twigCount; t++) {
           const side = t % 2 === 0 ? -1 : 1;
@@ -762,13 +1174,12 @@ export class LevelPhysicsRuntime {
           twig.position.set(side * 0.9, -0.1, 0);
           sproutPivot.add(twig);
 
-          // Swaying fanned jungle fern/palm fronds
+          // Real feathered swaying jungle palm fronds radiating off the bough
           for (let f = -1; f <= 1; f++) {
-            const frond = new THREE.Mesh(new THREE.ConeGeometry(0.48, 1.75, 5), leafMat);
-            frond.scale.set(1.0, 1.0, 0.2);
-            frond.position.set(side * 1.85, 0.35, f * 0.42);
-            frond.rotation.z = side * -0.92;
-            frond.rotation.x = f * 0.48;
+            const frond = new THREE.Mesh(sideFrondGeo, leafMat);
+            frond.position.set(side * 1.65, 0.15, f * 0.35);
+            frond.rotation.y = side * (Math.PI * 0.5) + f * 0.52;
+            frond.rotation.x = 0.24;
             sproutPivot.add(frond);
           }
 
@@ -805,25 +1216,17 @@ export class LevelPhysicsRuntime {
               new THREE.Vector3(side * 0.55, -1.5, 0.25),
               new THREE.Vector3(side * 0.35, -2.9, -0.15),
             ]);
-            const tendril = new THREE.Mesh(new THREE.TubeGeometry(vineCurve, 8, 0.05, 6, false), leafMat);
+            const tendril = new THREE.Mesh(new THREE.TubeGeometry(vineCurve, 8, 0.05, 6, false), tendrilMat);
             sproutPivot.add(tendril);
           }
 
-          // Lush roadside jungle bush cluster perched right at branch edge
+          // Lush roadside leafy jungle foliage sprig perched right at branch edge
           const bushPivot = new THREE.Group();
-          bushPivot.position.set(off.dx + side * (p.width * 0.49), off.dy + p.height * 0.44, tz);
-          const bushLeafGeo = new THREE.DodecahedronGeometry(0.36, 0);
-          for (let b = 0; b < 3; b++) {
-            const puff = new THREE.Mesh(bushLeafGeo, leafMat);
-            puff.position.set(
-              side * (0.10 + b * 0.14),
-              0.14 + (b === 1 ? 0.14 : 0),
-              (b - 1) * 0.24
-            );
-            puff.scale.set(1.15, 0.85 + (b % 2) * 0.2, 1.05);
-            puff.castShadow = true;
-            bushPivot.add(puff);
-          }
+          bushPivot.position.set(off.dx + side * (p.width * 0.49), off.dy + p.height * 0.48, tz);
+          const sprig = new THREE.Mesh(bushSprigGeo, bushLeafMat);
+          sprig.position.set(side * 0.18, 0.22, 0);
+          sprig.rotation.y = tz * 0.7;
+          bushPivot.add(sprig);
           group.add(bushPivot);
           this.swayNodes.push({
             obj: bushPivot,
@@ -994,8 +1397,15 @@ export class LevelPhysicsRuntime {
         this.world.addBody(body);
       } else if (o.kind === 'mystery_block' || o.kind === 'coin_box') {
         const isMystery = o.kind === 'mystery_block';
+        const isExtraLifeBox = !isMystery && o.reward === 'extra_life';
         const qMat = new THREE.MeshPhysicalMaterial({
-          map: isMystery ? this.textures.mysteryBlockTexture : this.textures.coinBoxTexture,
+          map: isMystery
+            ? this.textures.mysteryBlockTexture
+            : isExtraLifeBox
+            ? this.textures.extraLifeCoinBoxTexture
+            : this.textures.coinBoxTexture,
+          emissive: isExtraLifeBox ? 0xdc2626 : 0x000000,
+          emissiveIntensity: isExtraLifeBox ? 0.24 : 0,
           roughness: 0.28,
           metalness: 0.2,
           clearcoat: 0.45,
@@ -1009,6 +1419,7 @@ export class LevelPhysicsRuntime {
         // Ground target shadow directly below the floating box on the uneven branch top so player can aim jump!
         const shadowMat = new THREE.MeshBasicMaterial({
           map: this.textures.boxTargetShadowTexture,
+          color: isExtraLifeBox ? 0xfb7185 : 0xffffff,
           transparent: true,
           depthWrite: false,
           opacity: 0.92,
@@ -1147,23 +1558,23 @@ export class LevelPhysicsRuntime {
         const ironMat = new THREE.MeshStandardMaterial({ color: 0x64748b, roughness: 0.28, metalness: 0.85 });
         const hazardMat = new THREE.MeshStandardMaterial({ color: 0x991b1b, roughness: 0.45, metalness: 0.35 });
 
-        const topBar = new THREE.Mesh(new THREE.BoxGeometry(5.2, 0.32, 0.32), frameMat);
-        topBar.position.y = 4.6;
+        const topBar = new THREE.Mesh(new THREE.BoxGeometry(5.6, 0.34, 0.34), frameMat);
+        topBar.position.y = 5.45;
         group.add(topBar);
         for (const sx of [-1, 1]) {
-          const pillar = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.22, 4.6, 8), frameMat);
-          pillar.position.set(sx * 2.4, 2.3, 0);
+          const pillar = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.22, 5.45, 8), frameMat);
+          pillar.position.set(sx * 2.55, 2.72, 0);
           pillar.castShadow = true;
           group.add(pillar);
         }
 
         const arm = new THREE.Group();
-        arm.position.y = 4.55;
-        const rod = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 3.6, 8), ironMat);
-        rod.position.y = -1.8;
+        arm.position.y = 5.4;
+        const rod = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 4.05, 8), ironMat);
+        rod.position.y = -2.02;
         const mace = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.45, 1.5, 12), hazardMat);
         mace.rotation.x = Math.PI / 2;
-        mace.position.y = -3.65;
+        mace.position.y = -4.1;
         mace.castShadow = true;
         arm.add(rod, mace);
         group.add(arm);
@@ -1192,6 +1603,104 @@ export class LevelPhysicsRuntime {
         const marker = new THREE.Mesh(new THREE.TorusGeometry(0.65, 0.12, 8, 14, Math.PI), stoneMat);
         marker.position.y = 0.05;
         group.add(marker);
+      } else if (o.kind === 'blue_button') {
+        // Chunky Glowing 3D Blue Push-Button Pad with a friendly Gray Langoor perched on top!
+        const bezelMat = new THREE.MeshStandardMaterial({
+          color: 0x334155,
+          roughness: 0.45,
+          metalness: 0.62,
+        });
+        const rimAccentMat = new THREE.MeshStandardMaterial({
+          color: 0xfbbf24,
+          roughness: 0.28,
+          metalness: 0.8,
+        });
+        const buttonBlueMat = new THREE.MeshPhysicalMaterial({
+          color: 0x0284c7,
+          emissive: 0x0ea5e9,
+          emissiveIntensity: 0.42,
+          roughness: 0.16,
+          metalness: 0.08,
+          clearcoat: 0.92,
+          clearcoatRoughness: 0.12,
+        });
+        const buttonCoreMat = new THREE.MeshStandardMaterial({
+          color: 0x7dd3fc,
+          emissive: 0x38bdf8,
+          emissiveIntensity: 0.85,
+          roughness: 0.15,
+        });
+
+        // Heavy beveled octagonal-style metallic bezel housing anchored to the trail
+        const housingBase = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.88, 0.98, 0.18, 24),
+          bezelMat
+        );
+        housingBase.position.y = 0.09;
+        housingBase.castShadow = true;
+        housingBase.receiveShadow = true;
+        group.add(housingBase);
+
+        // Polished golden-bronze collar rim around the button socket
+        const rimCollar = new THREE.Mesh(new THREE.TorusGeometry(0.82, 0.055, 10, 28), rimAccentMat);
+        rimCollar.rotation.x = Math.PI / 2;
+        rimCollar.position.y = 0.18;
+        group.add(rimCollar);
+
+        // Pressable glowing blue button cap assembly (depresses cleanly when hit!)
+        const capGroup = new THREE.Group();
+        capGroup.position.y = 0;
+
+        const plungerShaft = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.68, 0.72, 0.24, 24),
+          buttonBlueMat
+        );
+        plungerShaft.position.y = 0.28;
+        plungerShaft.castShadow = true;
+        plungerShaft.receiveShadow = true;
+        capGroup.add(plungerShaft);
+
+        const plungerDome = new THREE.Mesh(
+          new THREE.SphereGeometry(0.68, 24, 12, 0, Math.PI * 2, 0, Math.PI * 0.42),
+          buttonBlueMat
+        );
+        plungerDome.scale.y = 0.34;
+        plungerDome.position.y = 0.38;
+        plungerDome.castShadow = true;
+        capGroup.add(plungerDome);
+
+        // Luminous sky-blue center ring emblem on top of the blue button
+        const emblemRing = new THREE.Mesh(new THREE.TorusGeometry(0.34, 0.042, 8, 24), buttonCoreMat);
+        emblemRing.rotation.x = Math.PI / 2;
+        emblemRing.position.y = 0.56;
+        capGroup.add(emblemRing);
+
+        const emblemDot = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.14, 0.04, 16), buttonCoreMat);
+        emblemDot.position.y = 0.55;
+        capGroup.add(emblemDot);
+
+        group.add(capGroup);
+        group.userData.buttonCap = capGroup;
+
+        // Glowing blue ground halo ring so players spot the blue button from far down the trail
+        const haloMat = new THREE.MeshBasicMaterial({
+          color: 0x38bdf8,
+          transparent: true,
+          opacity: 0.62,
+          side: THREE.DoubleSide,
+        });
+        const haloRing = new THREE.Mesh(new THREE.RingGeometry(0.96, 1.2, 28), haloMat);
+        haloRing.rotation.x = -Math.PI / 2;
+        haloRing.position.y = 0.03;
+        group.add(haloRing);
+        group.userData.haloRing = haloRing;
+
+        // Friendly Gray Langoor perched excitedly atop the blue button waiting to leap onto shoulder!
+        const perchedLangoor = buildLangoorModel(0.84, true);
+        perchedLangoor.root.position.set(0, 0.58, 0.02);
+        perchedLangoor.root.rotation.y = Math.PI; // Facing +Z toward approaching player
+        group.add(perchedLangoor.root);
+        armMesh = perchedLangoor.root;
       }
 
       this.levelGroup.add(group);
@@ -1208,6 +1717,266 @@ export class LevelPhysicsRuntime {
         armMesh,
       });
     }
+  }
+
+  private buildVines() {
+    if (!this.spec.vines || this.spec.vines.length === 0) return;
+
+    const palette = BIOME_PALETTES[this.spec.biome];
+    const barkMat = new THREE.MeshStandardMaterial({
+      map: this.textures.branchTextures[this.spec.biome],
+      bumpMap: this.textures.barkBumpTexture,
+      bumpScale: 0.14,
+      roughness: 0.88,
+      color: 0x6b472a,
+    });
+    const vineRopeMat = new THREE.MeshStandardMaterial({
+      color: 0x2f6b28,
+      roughness: 0.72,
+      metalness: 0.04,
+      bumpMap: this.textures.barkBumpTexture,
+      bumpScale: 0.08,
+    });
+    const vineAccentMat = new THREE.MeshStandardMaterial({
+      color: 0x4d8b31,
+      roughness: 0.65,
+    });
+    const leafSprigMat = applyFoliageWindShader(
+      new THREE.MeshStandardMaterial({
+        map: this.textures.canopyLeafClusterTexture,
+        alphaTest: 0.36,
+        side: THREE.DoubleSide,
+        color: new THREE.Color(palette.treeLeafHex).lerp(new THREE.Color(0x65a30d), 0.28),
+        roughness: 0.62,
+      }),
+      this.foliageWind.uniforms,
+      'canopy'
+    );
+    const knotMat = new THREE.MeshStandardMaterial({
+      color: 0xd97706,
+      roughness: 0.48,
+      metalness: 0.15,
+      emissive: 0x78350f,
+      emissiveIntensity: 0.35,
+    });
+    const glowRingMat = new THREE.MeshStandardMaterial({
+      color: 0xfde047,
+      emissive: 0x34d399,
+      emissiveIntensity: 0.95,
+      roughness: 0.25,
+      metalness: 0.2,
+    });
+
+    const sprigGeo = new THREE.PlaneGeometry(0.95, 0.95);
+    const boughLeafGeo = createLeafClusterGeometry(1.45);
+
+    for (const v of this.spec.vines) {
+      const anchorGroup = new THREE.Group();
+      anchorGroup.position.set(v.x, v.anchorY, v.z);
+
+      // Overhead jungle canopy bough arching across the chasm to root the vine naturally
+      const boughGeo = new THREE.CylinderGeometry(0.28, 0.36, 13.5, 8);
+      boughGeo.rotateZ(Math.PI * 0.5);
+      const bough = new THREE.Mesh(boughGeo, barkMat);
+      bough.position.set(0, 0.28, 0);
+      bough.castShadow = true;
+      anchorGroup.add(bough);
+
+      // Lush leafy bough clusters framing both ends of the overhead branch
+      for (const side of [-1, 1]) {
+        const tuft = new THREE.Mesh(boughLeafGeo, leafSprigMat);
+        tuft.position.set(side * 4.4, 0.55, side * 0.25);
+        tuft.scale.set(1.25, 0.85, 1.15);
+        anchorGroup.add(tuft);
+
+        const innerTuft = new THREE.Mesh(boughLeafGeo, leafSprigMat);
+        innerTuft.position.set(side * 1.9, 0.65, -side * 0.15);
+        innerTuft.scale.set(0.82, 0.62, 0.82);
+        anchorGroup.add(innerTuft);
+      }
+
+      // Woven branch wrap knot at pivot origin
+      const anchorWrap = new THREE.Mesh(new THREE.TorusGeometry(0.32, 0.1, 8, 12), vineRopeMat);
+      anchorWrap.rotation.y = Math.PI * 0.5;
+      anchorWrap.position.y = 0.22;
+      anchorGroup.add(anchorWrap);
+
+      // Swinging vine pivot (rotation.x = +angle swings handle toward -Z!)
+      const vinePivot = new THREE.Group();
+      anchorGroup.add(vinePivot);
+
+      // Main sturdy braided liana stem
+      const stemGeo = new THREE.CylinderGeometry(0.085, 0.11, v.length, 8, 6);
+      const stem = new THREE.Mesh(stemGeo, vineRopeMat);
+      stem.position.y = -v.length * 0.5;
+      stem.castShadow = true;
+      vinePivot.add(stem);
+
+      // Helical coiled secondary tendril wrapping down the main vine
+      const coilPts: THREE.Vector3[] = [];
+      const coilSteps = 18;
+      for (let s = 0; s <= coilSteps; s++) {
+        const t = s / coilSteps;
+        const a = t * Math.PI * 6;
+        coilPts.push(new THREE.Vector3(Math.cos(a) * 0.125, -t * v.length, Math.sin(a) * 0.125));
+      }
+      const coilCurve = new THREE.CatmullRomCurve3(coilPts);
+      const coilMesh = new THREE.Mesh(
+        new THREE.TubeGeometry(coilCurve, 24, 0.036, 5, false),
+        vineAccentMat
+      );
+      vinePivot.add(coilMesh);
+
+      // Lush alpha-cutout tropical leaf sprigs sprouting along the hanging vine
+      const sprigCount = 6;
+      for (let s = 0; s < sprigCount; s++) {
+        const ty = -0.65 - (s / (sprigCount - 1)) * (v.length - 1.55);
+        const angleY = s * 1.35;
+        const sprig = new THREE.Mesh(sprigGeo, leafSprigMat);
+        sprig.position.set(Math.cos(angleY) * 0.18, ty, Math.sin(angleY) * 0.18);
+        sprig.rotation.set(0.28, angleY, (s % 2 === 0 ? 1 : -1) * 0.35);
+        sprig.scale.setScalar(0.68 + (s % 3) * 0.14);
+        vinePivot.add(sprig);
+      }
+
+      // Tactile golden woven grab knot at the bottom of the vine
+      const knot = new THREE.Mesh(new THREE.SphereGeometry(0.26, 12, 10), knotMat);
+      knot.scale.set(1.05, 1.28, 1.05);
+      knot.position.y = -v.length;
+      vinePivot.add(knot);
+
+      // Hanging leafy tassel beneath grab knot
+      const tailSprig = new THREE.Mesh(sprigGeo, leafSprigMat);
+      tailSprig.position.set(0, -v.length - 0.45, 0);
+      tailSprig.scale.set(0.65, 0.78, 0.65);
+      vinePivot.add(tailSprig);
+
+      // Glowing emerald-gold grab ring so the player sees the swing target clearly from afar
+      const glowRing = new THREE.Mesh(new THREE.TorusGeometry(0.56, 0.055, 8, 20), glowRingMat);
+      glowRing.position.y = -v.length;
+      vinePivot.add(glowRing);
+
+      const initialAngle = Math.sin(v.phase) * v.swingAmp;
+      vinePivot.rotation.x = initialAngle;
+
+      this.levelGroup.add(anchorGroup);
+      this.vines.push({
+        spec: v,
+        anchorGroup,
+        vinePivot,
+        glowRing,
+        angle: initialAngle,
+        angVel: 0,
+      });
+    }
+  }
+
+  private buildFallingLeaves() {
+    const count = this.graphicsQuality === 'low' ? 22 : 44;
+
+    // Crisp pointed tropical leaf silhouette (zero NaN risk, catches directional sun & rim light)
+    const leafShape = new THREE.Shape();
+    leafShape.moveTo(0, -0.24);
+    leafShape.bezierCurveTo(0.16, -0.14, 0.19, 0.08, 0, 0.28);
+    leafShape.bezierCurveTo(-0.19, 0.08, -0.16, -0.14, 0, -0.24);
+    const leafGeo = new THREE.ShapeGeometry(leafShape, 5);
+    const pos = leafGeo.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      const lx = pos.getX(i);
+      const ly = pos.getY(i);
+      const cup = -Math.abs(lx) * 0.22 + ly * ly * 0.28;
+      pos.setZ(i, cup);
+    }
+    leafGeo.computeVertexNormals();
+
+    const leafMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.54,
+      metalness: 0.02,
+      side: THREE.DoubleSide,
+    });
+
+    const mesh = new THREE.InstancedMesh(leafGeo, leafMat, count);
+    mesh.frustumCulled = false;
+
+    const palette = BIOME_PALETTES[this.spec.biome];
+    const leafColors = [
+      new THREE.Color(palette.treeLeafHex).lerp(new THREE.Color(0x84cc16), 0.22),
+      new THREE.Color(palette.treeLeafHex),
+      new THREE.Color(0x65a30d),
+      new THREE.Color(0x22c55e),
+      new THREE.Color(0xd9f99d).lerp(new THREE.Color(0x4d7c0f), 0.55),
+    ];
+
+    const dummy = new THREE.Object3D();
+    this.fallingLeavesData = [];
+
+    for (let i = 0; i < count; i++) {
+      const x = (Math.random() - 0.5) * 18;
+      const y = 2 + Math.random() * 12;
+      const z = 4 - Math.random() * 44;
+      const scale = 0.65 + Math.random() * 0.85;
+      const item: FallingLeafData = {
+        x,
+        y,
+        z,
+        vx: (Math.random() - 0.5) * 0.9,
+        vy: -(0.75 + Math.random() * 0.85),
+        vz: (Math.random() - 0.5) * 0.6,
+        rotX: Math.random() * Math.PI * 2,
+        rotY: Math.random() * Math.PI * 2,
+        rotZ: Math.random() * Math.PI * 2,
+        spin: (Math.random() < 0.5 ? -1 : 1) * (1.2 + Math.random() * 2.1),
+        phase: Math.random() * Math.PI * 2,
+        scale,
+      };
+      this.fallingLeavesData.push(item);
+
+      dummy.position.set(x, y, z);
+      dummy.rotation.set(item.rotX, item.rotY, item.rotZ);
+      dummy.scale.setScalar(scale);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(i, dummy.matrix);
+      mesh.setColorAt(i, leafColors[i % leafColors.length]);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+
+    this.levelGroup.add(mesh);
+    this.fallingLeavesMesh = mesh;
+  }
+
+  private updateFallingLeaves(dt: number, px: number, py: number, pz: number) {
+    if (!this.fallingLeavesMesh || this.fallingLeavesData.length === 0) return;
+    const dum = this.swayDummy;
+    const t = this.elapsed;
+
+    for (let i = 0; i < this.fallingLeavesData.length; i++) {
+      const lf = this.fallingLeavesData[i];
+      const flutterX = Math.sin(t * 2.1 + lf.phase) * 1.15;
+      const flutterZ = Math.cos(t * 1.65 + lf.phase * 1.3) * 0.65;
+
+      lf.x += (lf.vx + flutterX) * dt;
+      lf.y += lf.vy * dt;
+      lf.z += (lf.vz + flutterZ) * dt;
+      lf.rotX += lf.spin * 0.75 * dt;
+      lf.rotY += lf.spin * 0.55 * dt;
+      lf.rotZ += Math.sin(t * 2.4 + lf.phase) * 1.6 * dt;
+
+      // Recycle drifting leaf back up into the jungle canopy ahead of the player
+      if (lf.y < py - 4.5 || lf.z > pz + 13 || lf.z < pz - 46 || Math.abs(lf.x - px) > 16) {
+        lf.x = px + (Math.random() - 0.5) * 19;
+        lf.y = py + 6.5 + Math.random() * 8.5;
+        lf.z = pz - 3 - Math.random() * 34;
+      }
+
+      dum.position.set(lf.x, lf.y, lf.z);
+      dum.rotation.set(lf.rotX, lf.rotY, lf.rotZ);
+      dum.scale.setScalar(lf.scale);
+      dum.updateMatrix();
+      this.fallingLeavesMesh.setMatrixAt(i, dum.matrix);
+    }
+    this.fallingLeavesMesh.instanceMatrix.needsUpdate = true;
   }
 
   private buildCoins() {
@@ -1305,6 +2074,34 @@ export class LevelPhysicsRuntime {
       this.levelGroup.add(m);
       this.particles.push({ mesh: m, vel, life: 0.55, maxLife: 0.55 });
     }
+  }
+
+  public spawnRunTrail(pos: THREE.Vector3, hexColor: number) {
+    const mat = new THREE.MeshBasicMaterial({
+      color: hexColor,
+      transparent: true,
+      opacity: 0.55,
+      depthWrite: false,
+    });
+    const m = new THREE.Mesh(this.particleGeo, mat);
+    m.position.copy(pos);
+    m.scale.setScalar(0.42);
+    const vel = new THREE.Vector3(
+      (Math.random() - 0.5) * 0.55,
+      0.32 + Math.random() * 0.4,
+      0.35 + Math.random() * 0.5
+    );
+    this.levelGroup.add(m);
+    this.particles.push({
+      mesh: m,
+      vel,
+      life: 0.24,
+      maxLife: 0.24,
+      baseScale: 0.42,
+      gravity: 2.6,
+      baseOpacity: 0.55,
+      disposeMat: true,
+    });
   }
 
   private spawnBoulder(origin: THREE.Vector3) {
@@ -1457,16 +2254,27 @@ export class LevelPhysicsRuntime {
       limb.receiveShadow = true;
       treeGroup.add(limb);
 
-      // Lush Jungle Canopy + Hanging Banana Bunch wrapped in reactive sway pivot
+      // Lush Real-Leaf Jungle Canopy + Hanging Banana Bunch wrapped in reactive sway pivot
       const canopyPivot = new THREE.Group();
       canopyPivot.position.set(trunkX, platTopY + 5.8, 0);
 
-      const canopy = new THREE.Mesh(new THREE.DodecahedronGeometry(2.7, 1), leafMat);
-      canopy.scale.set(1.25, 0.65, 1.15);
-      canopy.position.set(-side * 0.5, 1.4, 0);
-      const canopySide = new THREE.Mesh(new THREE.DodecahedronGeometry(1.9, 1), leafMat);
-      canopySide.scale.set(1.1, 0.65, 1.0);
-      canopySide.position.set(perchX - trunkX + side * 0.5, 0.6, 0.4);
+      const monkeyLeafMat = applyFoliageWindShader(
+        new THREE.MeshStandardMaterial({
+          color: 0xa4df68,
+          map: this.textures.canopyLeafClusterTexture,
+          alphaTest: 0.36,
+          roughness: 0.62,
+          side: THREE.DoubleSide,
+        }),
+        this.foliageWind.uniforms,
+        'canopy'
+      );
+      const monkeyCanopyGeo = createLeafClusterGeometry(3.15);
+      const canopy = new THREE.Mesh(monkeyCanopyGeo, monkeyLeafMat);
+      canopy.position.set(-side * 0.5, 1.35, 0);
+      const canopySide = new THREE.Mesh(monkeyCanopyGeo, monkeyLeafMat);
+      canopySide.scale.setScalar(0.76);
+      canopySide.position.set(perchX - trunkX + side * 0.5, 0.65, 0.4);
       canopyPivot.add(canopy, canopySide);
 
       // Hanging cluster of yellow bananas under the canopy limb
@@ -1601,6 +2409,8 @@ export class LevelPhysicsRuntime {
         throwCooldown: 0,
         windupTimer: 0,
         phase: i * 1.4,
+        audioId: `monkey_${this.spec.levelNumber}_${i}`,
+        passByChattered: false,
       });
     }
   }
@@ -1620,6 +2430,11 @@ export class LevelPhysicsRuntime {
     const vy = (targetY - startPos.y - 0.5 * gravity * flightTime * flightTime) / flightTime;
 
     const bananaMesh = this.createBananaMesh(1.65);
+    bananaMesh.traverse((obj) => {
+      if ((obj as THREE.Mesh).isMesh) {
+        (obj as THREE.Mesh).castShadow = true;
+      }
+    });
     bananaMesh.position.copy(startPos);
     this.levelGroup.add(bananaMesh);
 
@@ -1634,7 +2449,77 @@ export class LevelPhysicsRuntime {
   public triggerJump(inputJumpPressed: boolean) {
     if (inputJumpPressed) {
       this.jumpBufferTimer = 0.16;
+      this.pendingAirSlide = false;
+      if (this.grounded) {
+        this.jumpAnticipationTimer = 0.06;
+      }
+      // Temple Run slide-to-jump cancel: jumping immediately exits slide
+      if (this.slideTimer > 0) {
+        this.slideTimer = 0;
+      }
     }
+  }
+
+  public triggerSlide(inputSlidePressed: boolean) {
+    if (!inputSlidePressed) return;
+    if (this.grounded) {
+      if (this.slideTimer <= 0.14) {
+        this.slideTimer = this.slideDuration;
+        this.slideDustAcc = 0;
+        soundEngine.slide(this.getCurrentTerrain());
+        this.spawnBurst(
+          new THREE.Vector3(
+            this.playerBody.position.x,
+            this.playerBody.position.y - this.playerRadius + 0.08,
+            this.playerBody.position.z + 0.25
+          ),
+          0xd6cbb8,
+          6
+        );
+      }
+    } else {
+      // Mid-air swipe down: snappy Temple Run fast-fall straight into a ground slide!
+      this.playerBody.velocity.y = Math.min(this.playerBody.velocity.y, -19.5);
+      this.pendingAirSlide = true;
+      this.flipAnimTimer = 0;
+    }
+  }
+
+  public shiftLane(delta: -1 | 1) {
+    const next = Math.max(-1, Math.min(1, this.currentLane + delta)) as -1 | 0 | 1;
+    this.laneModeActive = true;
+    if (next !== this.currentLane) {
+      this.currentLane = next;
+      this.laneSwitchDir = delta;
+      this.laneSwitchTimer = this.laneSwitchDuration;
+      soundEngine.laneSwitch();
+    } else {
+      // Subtle lean feedback even when nudging at edge lane
+      this.laneSwitchDir = delta;
+      this.laneSwitchTimer = 0.12;
+    }
+  }
+
+  private getCurrentLaneReference(): { centerX: number; spacing: number } {
+    let refPlat = this.standingPlatform;
+    if (!refPlat) {
+      const pz = this.playerBody.position.z;
+      let bestDist = Infinity;
+      for (const p of this.platforms) {
+        const halfD = p.spec.depth * 0.5;
+        if (pz <= p.mesh.position.z + halfD + 1.5 && pz >= p.mesh.position.z - halfD - 6.0) {
+          const d = Math.abs(p.mesh.position.z - pz);
+          if (d < bestDist) {
+            bestDist = d;
+            refPlat = p;
+          }
+        }
+      }
+    }
+    const centerX = refPlat ? refPlat.mesh.position.x : 0;
+    const width = refPlat ? refPlat.spec.width : 6.4;
+    const spacing = THREE.MathUtils.clamp((width - 1.35) * 0.36, 1.32, 2.02);
+    return { centerX, spacing };
   }
 
   public fireBlasterProjectile() {
@@ -1915,10 +2800,262 @@ export class LevelPhysicsRuntime {
     return null;
   }
 
+  /**
+   * General downward physics surface query for moving obstacles, boulders, and airborne props.
+   * Reuses pre-allocated raycast vectors (zero GC allocations).
+   */
+  public sampleSurfaceBelow(x: number, startY: number, z: number): number | null {
+    this.shadowRayFrom.set(x, startY + 0.28, z);
+    this.shadowRayTo.set(x, startY - 16.0, z);
+    this.shadowRayResult.reset();
+    this.world.raycastClosest(
+      this.shadowRayFrom,
+      this.shadowRayTo,
+      { skipBackfaces: true, collisionFilterMask: 1 },
+      this.shadowRayResult
+    );
+    if (
+      this.shadowRayResult.hasHit &&
+      this.shadowRayResult.body !== this.playerBody &&
+      this.shadowRayResult.hitNormalWorld.y > 0.45
+    ) {
+      return this.shadowRayResult.hitPointWorld.y;
+    }
+    return null;
+  }
+
+  private _surprisePosTmp = new THREE.Vector3();
+
+  /**
+   * Populates a pre-allocated array with all nearby moving obstacles and dynamic actors
+   * so DynamicObstacleShadowSystem can project unified time-of-day & weather-reactive shadows.
+   */
+  public collectMovingObstacleShadows(
+    out: ObstacleShadowCaster[],
+    playerZ: number
+  ): number {
+    let n = 0;
+    const minZ = playerZ - 58;
+    const maxZ = playerZ + 12;
+
+    const pushCaster = (
+      x: number,
+      y: number,
+      z: number,
+      groundY: number,
+      radiusX: number,
+      radiusZ: number,
+      rotY: number,
+      shape: 'oval' | 'bar',
+      intensityMul: number,
+      castHeight: number
+    ) => {
+      if (n < out.length) {
+        const slot = out[n];
+        slot.x = x;
+        slot.y = y;
+        slot.z = z;
+        slot.groundY = groundY;
+        slot.radiusX = radiusX;
+        slot.radiusZ = radiusZ;
+        slot.rotY = rotY;
+        slot.shape = shape;
+        slot.intensityMul = intensityMul;
+        slot.castHeight = castHeight;
+      } else {
+        out.push({
+          x,
+          y,
+          z,
+          groundY,
+          radiusX,
+          radiusZ,
+          rotY,
+          shape,
+          intensityMul,
+          castHeight,
+        });
+      }
+      n++;
+    };
+
+    // 1. Moving Obstacles (patrolling crabs/beetles, swinging pendulums, rotating sweepers, hovering pickups)
+    for (let i = 0; i < this.obstacles.length; i++) {
+      const o = this.obstacles[i];
+      if (!o.alive) continue;
+      const oz = o.basePos.z;
+      if (oz < minZ || oz > maxZ) continue;
+
+      const kind = o.spec.kind;
+      if (kind === 'crab' || kind === 'beetle') {
+        pushCaster(
+          o.mesh.position.x,
+          o.basePos.y + 0.06,
+          oz,
+          o.basePos.y,
+          kind === 'crab' ? 0.72 : 0.66,
+          kind === 'crab' ? 0.62 : 0.66,
+          0,
+          'oval',
+          1.0,
+          0.65
+        );
+      } else if (kind === 'pendulum' && o.armMesh) {
+        const swingAngle = o.armMesh.rotation.z;
+        const maceX = o.basePos.x + Math.sin(swingAngle) * 4.1;
+        const maceY = o.basePos.y + 5.4 - Math.cos(swingAngle) * 4.1;
+        // Ground-projected swinging spiked mace shadow
+        pushCaster(
+          maceX,
+          Math.max(o.basePos.y, maceY - 0.52),
+          oz,
+          o.basePos.y,
+          0.86,
+          0.86,
+          0,
+          'oval',
+          1.12,
+          1.15
+        );
+      } else if (kind === 'sweeper' && o.armMesh) {
+        const halfBar = Math.min(4.6, (o.spec.width ?? 5) * 0.72) * 0.5;
+        pushCaster(
+          o.basePos.x,
+          o.basePos.y + 0.62,
+          oz,
+          o.basePos.y,
+          halfBar,
+          0.34,
+          o.armMesh.rotation.y,
+          'bar',
+          1.05,
+          0.72
+        );
+      } else if (kind === 'power_mushroom') {
+        pushCaster(
+          o.basePos.x,
+          o.mesh.position.y + 0.12,
+          oz,
+          o.basePos.y,
+          0.56,
+          0.56,
+          0,
+          'oval',
+          0.85,
+          0.65
+        );
+      } else if (kind === 'blue_button' && !o.used && o.armMesh) {
+        // Peeking bouncing Langoor companion atop the button
+        pushCaster(
+          o.basePos.x,
+          o.basePos.y + o.armMesh.position.y,
+          oz,
+          o.basePos.y + 0.24,
+          0.42,
+          0.42,
+          0,
+          'oval',
+          0.72,
+          0.55
+        );
+      }
+    }
+
+    // 2. Rolling Physics Boulders (raycast ground so bouncing/falling boulders dynamically fade & soften)
+    for (let i = 0; i < this.boulders.length; i++) {
+      const b = this.boulders[i];
+      const bx = b.body.position.x;
+      const by = b.body.position.y;
+      const bz = b.body.position.z;
+      if (bz < minZ || bz > maxZ) continue;
+      const groundY = this.sampleSurfaceBelow(bx, by, bz);
+      if (groundY !== null) {
+        pushCaster(
+          bx,
+          Math.max(groundY, by - 0.68),
+          bz,
+          groundY,
+          0.95,
+          0.95,
+          0,
+          'oval',
+          1.16,
+          1.35
+        );
+      }
+    }
+
+    // 3. Monkey-Thrown Airborne Bananas (clear trajectory depth cue on jungle floor)
+    for (let i = 0; i < this.thrownBananas.length; i++) {
+      const tb = this.thrownBananas[i];
+      if (tb.pos.z < minZ || tb.pos.z > maxZ) continue;
+      const groundY = this.sampleSurfaceBelow(tb.pos.x, tb.pos.y, tb.pos.z);
+      if (groundY !== null) {
+        pushCaster(
+          tb.pos.x,
+          tb.pos.y,
+          tb.pos.z,
+          groundY,
+          0.44,
+          0.38,
+          0,
+          'oval',
+          0.82,
+          0.35
+        );
+      }
+    }
+
+    // 4. Leaping Langoor Companion Arc
+    if (this.leapingLangoor) {
+      const lpPos = this.leapingLangoor.rig.root.position;
+      const groundY = this.sampleSurfaceBelow(lpPos.x, lpPos.y, lpPos.z);
+      if (groundY !== null) {
+        pushCaster(
+          lpPos.x,
+          lpPos.y,
+          lpPos.z,
+          groundY,
+          0.54,
+          0.54,
+          0,
+          'oval',
+          0.88,
+          0.7
+        );
+      }
+    }
+
+    // 5. Active Surprise Jungle Animal (tiger, elephant, peacock, deer, fox, panda, croc, toucan, bear, panther)
+    if (this.surpriseAnimal.getWorldPosition(this._surprisePosTmp)) {
+      const sp = this._surprisePosTmp;
+      if (sp.z >= minZ && sp.z <= maxZ) {
+        const groundY = this.sampleSurfaceBelow(sp.x, sp.y + 0.5, sp.z);
+        if (groundY !== null) {
+          const animalScale = this.surpriseAnimal.spec.scale;
+          pushCaster(
+            sp.x,
+            sp.y,
+            sp.z,
+            groundY,
+            0.95 * animalScale,
+            0.85 * animalScale,
+            0,
+            'oval',
+            1.05,
+            1.25 * animalScale
+          );
+        }
+      }
+    }
+
+    return n;
+  }
+
   public step(
     dt: number,
     input: InputState,
-    trailColorHex: number,
+    _trailColorHex: number,
     callbacks: {
       onCoin: (amount: number) => void;
       onHurt: () => void;
@@ -1927,9 +3064,10 @@ export class LevelPhysicsRuntime {
       onFellInChasm: () => void;
       onBoxHit?: () => void;
       onEnemyDefeated?: () => void;
+      onExtraLife?: () => boolean;
     },
     rainStrength = 0
-  ): { speedHoriz: number; velY: number; strafeVelX: number; footY: number } {
+  ): StepResult {
     const clampedDt = Math.min(dt, 0.05);
     this.elapsed += clampedDt;
     this.textures.waterTexture.offset.y -= clampedDt * 0.08;
@@ -1939,118 +3077,47 @@ export class LevelPhysicsRuntime {
     const pSpeed = Math.hypot(this.playerBody.velocity.x, this.playerBody.velocity.z);
     const speedFactor = Math.min(1.4, 0.22 + pSpeed / 9.5);
 
-    // Subtle ambient breeze + pass-by spring reactivity on bushes, twigs & monkey tree canopies
-    for (const s of this.swayNodes) {
-      const distSq = (pCurX - s.worldX) * (pCurX - s.worldX) + (pCurZ - s.worldZ) * (pCurZ - s.worldZ);
-      let targetWake = 0;
-      if (distSq < 81) {
-        const dist = Math.sqrt(distSq);
-        targetWake = (1 - dist / 9) * 0.24 * speedFactor;
-      }
-      // Damped spring toward targetWake so foliage parts as player passes and springs smoothly back
-      const force = (targetWake - s.wake) * 42 - s.wakeVel * 8.5;
-      s.wakeVel += force * clampedDt;
-      s.wake += s.wakeVel * clampedDt;
-
-      const breezeZ = Math.sin(this.elapsed * s.speed + s.phase) * s.amp;
-      const breezeX = Math.cos(this.elapsed * s.speed * 0.8 + s.phase) * (s.amp * 0.65);
-      s.obj.rotation.z = s.baseRotZ + breezeZ - s.side * s.wake;
-      s.obj.rotation.x = s.baseRotX + breezeX - Math.abs(s.wake) * 0.55;
-    }
-
-    // Subtle wind & pass-by reactivity on nearby canyon jungle trees & canyon grass/bushes
-    if (this.sceneryTrunks && this.sceneryCanopies) {
-      let updatedTrees = false;
-      const dum = this.swayDummy;
-      for (let i = 0; i < this.sceneryTreeData.length; i++) {
-        const td = this.sceneryTreeData[i];
-        const dz = Math.abs(td.z - pCurZ);
-        if (dz > 28 && Math.abs(td.bend) < 0.002 && Math.abs(td.bendVel) < 0.002) continue;
-
-        let targetBend = 0;
-        if (dz < 14) {
-          const dist = Math.hypot(pCurX - td.x, pCurZ - td.z);
-          if (dist < 18) {
-            targetBend = (1 - dist / 18) * 0.075 * speedFactor;
-          }
-        }
-        const f = (targetBend - td.bend) * 28 - td.bendVel * 6.5;
-        td.bendVel += f * clampedDt;
-        td.bend += td.bendVel * clampedDt;
-
-        const breeze = Math.sin(this.elapsed * 1.35 + td.phase) * 0.022;
-        const swayZ = td.side * -0.08 + breeze - td.side * td.bend;
-        const swayX = Math.cos(this.elapsed * 1.1 + td.phase) * 0.014 - td.bend * 0.55;
-
-        dum.position.set(td.x, td.y + 4.2 * td.scale, td.z);
-        dum.scale.set(td.scale, td.scale, td.scale);
-        dum.rotation.set(swayX, td.rotY, swayZ);
-        dum.updateMatrix();
-        this.sceneryTrunks.setMatrixAt(i, dum.matrix);
-
-        const crownH = 4.4 * td.scale;
-        const leanX = -Math.sin(swayZ - td.side * -0.08) * crownH;
-        const leanZ = Math.sin(swayX) * crownH;
-        dum.position.set(td.x + leanX, td.y + 8.6 * td.scale, td.z + leanZ);
-        dum.scale.set(td.scale * 1.35, td.scale * 0.9, td.scale * 1.35);
-        dum.rotation.set(swayX, i * 0.6, breeze - td.side * td.bend);
-        dum.updateMatrix();
-        this.sceneryCanopies.setMatrixAt(i * 2, dum.matrix);
-
-        dum.position.set(
-          td.x - td.side * 1.4 * td.scale + leanX * 0.85,
-          td.y + 7.5 * td.scale,
-          td.z + 0.8 + leanZ * 0.85
-        );
-        dum.scale.set(td.scale * 1.05, td.scale * 0.75, td.scale * 1.05);
-        dum.updateMatrix();
-        this.sceneryCanopies.setMatrixAt(i * 2 + 1, dum.matrix);
-        updatedTrees = true;
-      }
-      if (updatedTrees) {
-        this.sceneryTrunks.instanceMatrix.needsUpdate = true;
-        this.sceneryCanopies.instanceMatrix.needsUpdate = true;
-      }
-    }
-
-    if (this.sceneryBlades) {
-      let updatedBlades = false;
-      const dum = this.swayDummy;
-      for (let i = 0; i < this.sceneryBladeData.length; i++) {
-        const bd = this.sceneryBladeData[i];
-        const dz = Math.abs(bd.z - pCurZ);
-        if (dz > 22 && Math.abs(bd.bend) < 0.003 && Math.abs(bd.bendVel) < 0.003) continue;
-
-        let targetBend = 0;
-        if (dz < 11) {
-          const dist = Math.hypot(pCurX - bd.x, pCurZ - bd.z);
-          if (dist < 13) {
-            targetBend = (1 - dist / 13) * 0.22 * speedFactor;
-          }
-        }
-        const f = (targetBend - bd.bend) * 38 - bd.bendVel * 8.0;
-        bd.bendVel += f * clampedDt;
-        bd.bend += bd.bendVel * clampedDt;
-
-        const breeze = Math.sin(this.elapsed * 2.1 + bd.phase) * 0.08;
-        dum.position.set(bd.x, bd.y, bd.z);
-        dum.rotation.set(
-          bd.baseRotX - bd.bend * 0.6,
-          bd.baseRotY,
-          bd.baseRotZ + breeze - bd.side * bd.bend
-        );
-        dum.scale.set(1, bd.scaleY, 1);
-        dum.updateMatrix();
-        this.sceneryBlades.setMatrixAt(i, dum.matrix);
-        updatedBlades = true;
-      }
-      if (updatedBlades) {
-        this.sceneryBlades.instanceMatrix.needsUpdate = true;
-      }
-    }
+    this.updateVegetationWind(clampedDt, pCurX, pCurZ, speedFactor);
     if (this.invulnTimer > 0) this.invulnTimer = Math.max(0, this.invulnTimer - clampedDt);
+    if (this.extraLifeNoticeTimer > 0) {
+      this.extraLifeNoticeTimer = Math.max(0, this.extraLifeNoticeTimer - clampedDt);
+    }
     if (this.flipAnimTimer > 0) this.flipAnimTimer = Math.max(0, this.flipAnimTimer - clampedDt);
     if (this.fireCooldown > 0) this.fireCooldown = Math.max(0, this.fireCooldown - clampedDt);
+    if (this.vineReleaseCooldown > 0) {
+      this.vineReleaseCooldown = Math.max(0, this.vineReleaseCooldown - clampedDt);
+    }
+    if (this.laneSwitchTimer > 0) {
+      this.laneSwitchTimer = Math.max(0, this.laneSwitchTimer - clampedDt);
+      if (this.laneSwitchTimer <= 0) this.laneSwitchDir = 0;
+    }
+    if (this.jumpAnticipationTimer > 0) {
+      this.jumpAnticipationTimer = Math.max(0, this.jumpAnticipationTimer - clampedDt);
+    }
+    if (this.landingTimer > 0) {
+      this.landingTimer = Math.max(0, this.landingTimer - clampedDt);
+    }
+    if (this.stumbleTimer > 0) {
+      this.stumbleTimer = Math.max(0, this.stumbleTimer - clampedDt);
+    }
+    if (this.slideTimer > 0) {
+      this.slideTimer = Math.max(0, this.slideTimer - clampedDt);
+      if (this.grounded) {
+        this.slideDustAcc += clampedDt;
+        if (this.slideDustAcc >= 0.085) {
+          this.slideDustAcc = 0;
+          this.spawnBurst(
+            new THREE.Vector3(
+              this.playerBody.position.x + (Math.random() - 0.5) * 0.28,
+              this.playerBody.position.y - this.playerRadius + 0.06,
+              this.playerBody.position.z + 0.28
+            ),
+            0xcfc4b0,
+            2
+          );
+        }
+      }
+    }
     if (this.powerUpTimer > 0) {
       this.powerUpTimer -= clampedDt;
       if (this.powerUpTimer <= 0) {
@@ -2061,6 +3128,41 @@ export class LevelPhysicsRuntime {
     if (input.firePressed) {
       this.fireBlasterProjectile();
     }
+
+    // Discrete 3-lane swipes & edge-triggered keyboard/button lane taps
+    if (input.laneLeftPressed) {
+      this.shiftLane(-1);
+    } else if (input.laneRightPressed) {
+      this.shiftLane(1);
+    }
+
+    const leftJustPressed = input.left && !this.prevInputLeft;
+    const rightJustPressed = input.right && !this.prevInputRight;
+    if (leftJustPressed && !input.laneLeftPressed) {
+      this.shiftLane(-1);
+      this.holdStrafeTimer = 0;
+    } else if (rightJustPressed && !input.laneRightPressed) {
+      this.shiftLane(1);
+      this.holdStrafeTimer = 0;
+    }
+
+    if (input.left || input.right) {
+      this.holdStrafeTimer += clampedDt;
+      if (this.holdStrafeTimer > 0.20) {
+        // Seamless continuous steering if user holds arrow/D-pad continuously
+        this.laneModeActive = false;
+      }
+    } else {
+      if (!this.laneModeActive && (this.prevInputLeft || this.prevInputRight)) {
+        // Snap logical lane index to nearest lane after continuous adjustment
+        const ref = this.getCurrentLaneReference();
+        const rel = (this.playerBody.position.x - ref.centerX) / Math.max(0.5, ref.spacing);
+        this.currentLane = Math.max(-1, Math.min(1, Math.round(rel))) as -1 | 0 | 1;
+      }
+      this.holdStrafeTimer = 0;
+    }
+    this.prevInputLeft = input.left;
+    this.prevInputRight = input.right;
 
     // 1. Update Moving & Crumbling Platforms BEFORE physics step
     for (const p of this.platforms) {
@@ -2106,164 +3208,316 @@ export class LevelPhysicsRuntime {
       this.playerBody.position.z += dz;
     }
 
-    // 2. Player Horizontal Physics Control (Mario-style weighty acceleration + friction)
-    const speedBoost = this.activePowerUp === 'speed' ? 1.38 : 1.0;
-    const maxForwardSpeed = (input.sprint ? 13.4 : 11.2) * speedBoost;
-    const maxStrafeSpeed = 7.8 * speedBoost;
-
-    let moveX = (input.right ? 1 : 0) - (input.left ? 1 : 0);
-    let moveZ = 0;
-    if (input.autoRun || input.sprint) {
-      moveZ = input.backward ? 0 : -1;
-    } else {
-      moveZ = input.forward ? -1 : 0;
-    }
-
-    const onIce = this.standingPlatform?.spec.kind === 'ice';
-    const accelGround = onIce ? 14 : 44;
-    const accelAir = 30;
-    const accel = this.grounded ? accelGround : accelAir;
-
-    const targetVx = moveX * maxStrafeSpeed;
-    const targetVz = moveZ * maxForwardSpeed;
-
-    const blend = Math.min(1, accel * clampedDt * (onIce ? 0.25 : 0.45));
-    this.playerBody.velocity.x = THREE.MathUtils.lerp(this.playerBody.velocity.x, targetVx, blend);
-    this.playerBody.velocity.z = THREE.MathUtils.lerp(this.playerBody.velocity.z, targetVz, blend);
-    // Character never runs backward (+Z); allow only brief initial hurt-knockback recoil
-    if (this.invulnTimer <= 1.25 && this.playerBody.velocity.z > 0) {
-      this.playerBody.velocity.z = 0;
-    }
-
-    // 3. Jump & Double Jump with Coyote Time, Buffer & Crisp Fall Gravity
+    // 2. Vine Swinging Pendulum Physics OR Normal Running/Jumping Physics
     if (this.jumpBufferTimer > 0) this.jumpBufferTimer -= clampedDt;
-    if (this.grounded) {
-      this.coyoteTimer = 0.16;
-      this.jumpsUsed = 0;
-      this.jumpHoldTimer = 0;
-    } else {
-      if (this.coyoteTimer > 0) this.coyoteTimer -= clampedDt;
-      this.jumpHoldTimer += clampedDt;
-    }
+    let footY = this.playerBody.position.y - this.playerRadius;
 
-    if (this.jumpBufferTimer > 0) {
-      if (this.coyoteTimer > 0) {
-        this.playerBody.velocity.y = 13.8;
-        this.grounded = false;
+    if (this.activeVine) {
+      const v = this.activeVine;
+      const L = v.spec.length;
+      const wantForward = input.autoRun || input.forward || input.sprint;
+      const gravityAccel = -(22.0 / L) * Math.sin(v.angle);
+      const pumpAccel = wantForward ? (v.angVel >= -0.15 ? 2.75 : 0.9) : 0;
+
+      v.angVel += (gravityAccel + pumpAccel) * clampedDt;
+      v.angVel *= Math.exp(-0.16 * clampedDt);
+      v.angVel = THREE.MathUtils.clamp(v.angVel, -2.95, 3.25);
+      v.angle += v.angVel * clampedDt;
+      if (v.angle > 1.22) {
+        v.angle = 1.22;
+        if (v.angVel > 0) v.angVel *= -0.4;
+      } else if (v.angle < -1.16) {
+        v.angle = -1.16;
+        if (v.angVel < 0) v.angVel *= -0.4;
+      }
+      v.vinePivot.rotation.x = v.angle;
+      const ringPulse = 1.08 + Math.sin(this.elapsed * 9) * 0.14;
+      v.glowRing.scale.setScalar(ringPulse);
+
+      // Gentle lateral steering while swinging to align with the far landing cliff
+      const steerX = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+      if (steerX !== 0) {
+        this.vineLateralX = THREE.MathUtils.clamp(
+          this.vineLateralX + steerX * 3.8 * clampedDt,
+          -1.55,
+          1.55
+        );
+      } else if (this.laneModeActive) {
+        const desiredOffset = THREE.MathUtils.clamp(this.currentLane * 1.15, -1.4, 1.4);
+        this.vineLateralX = THREE.MathUtils.damp(this.vineLateralX, desiredOffset, 6.5, clampedDt);
+      } else {
+        this.vineLateralX = THREE.MathUtils.damp(this.vineLateralX, 0, 2.2, clampedDt);
+      }
+
+      const handleX = v.spec.x + this.vineLateralX;
+      const handleY = v.spec.anchorY - L * Math.cos(v.angle);
+      const handleZ = v.spec.z - L * Math.sin(v.angle);
+      footY = handleY - 2.2;
+
+      const tanVz = -L * Math.cos(v.angle) * v.angVel;
+      const tanVy = L * Math.sin(v.angle) * v.angVel;
+      this.playerBody.position.set(handleX, footY + this.playerRadius, handleZ);
+      this.playerBody.velocity.set(steerX * 3.2, tanVy, tanVz);
+      this.grounded = false;
+      this.standingPlatform = null;
+      this.wasGrounded = false;
+      this.footstepAcc = 0;
+
+      // Update other idle vines while swinging on this one
+      for (const other of this.vines) {
+        if (other === v) continue;
+        other.angle = Math.sin(this.elapsed * other.spec.swingSpeed + other.spec.phase) * other.spec.swingAmp;
+        other.angVel =
+          Math.cos(this.elapsed * other.spec.swingSpeed + other.spec.phase) *
+          other.spec.swingAmp *
+          other.spec.swingSpeed;
+        other.vinePivot.rotation.x = other.angle;
+        other.glowRing.scale.setScalar(1 + Math.sin(this.elapsed * 4.2 + other.spec.phase) * 0.14);
+      }
+
+      // Release on Jump / Swipe Up OR automatic apex release in Auto-Run mode!
+      const autoApexRelease = input.autoRun && v.angle >= 0.68 && v.angVel > 0.25;
+      if (this.jumpBufferTimer > 0 || autoApexRelease) {
+        const launchVz = THREE.MathUtils.clamp(Math.min(-13.2, tanVz * 1.18 - 3.6), -18.0, -11.5);
+        const launchVy = THREE.MathUtils.clamp(Math.max(11.2, tanVy * 1.12 + 6.5), 10.6, 15.2);
+        const launchVx = THREE.MathUtils.clamp(steerX * 4.8, -5.0, 5.0);
+        this.playerBody.velocity.set(launchVx, launchVy, launchVz);
+        this.activeVine = null;
+        this.vineReleaseCooldown = 0.56;
+        this.jumpBufferTimer = 0;
+        this.jumpsUsed = 1; // Keep 1 mid-air double jump in reserve for forgiving landings
         this.coyoteTimer = 0;
-        this.jumpBufferTimer = 0;
-        this.jumpHoldTimer = 0;
-        this.jumpsUsed = 1;
-        soundEngine.jump();
-        this.spawnBurst(
-          new THREE.Vector3(this.playerBody.position.x, this.playerBody.position.y - 0.3, this.playerBody.position.z),
-          0xe7e5e4,
-          7
-        );
-      } else if (this.jumpsUsed < 2) {
-        this.playerBody.velocity.y = 13.2;
-        this.jumpBufferTimer = 0;
-        this.jumpsUsed = 2;
-        this.flipAnimTimer = 0.52;
-        soundEngine.doubleJump();
-        this.spawnBurst(
-          new THREE.Vector3(this.playerBody.position.x, this.playerBody.position.y - 0.15, this.playerBody.position.z),
-          trailColorHex,
-          12
-        );
+        soundEngine.vineRelease();
+        this.spawnBurst(new THREE.Vector3(handleX, handleY, handleZ), 0x4ade80, 12);
+        this.spawnBurst(new THREE.Vector3(handleX, handleY, handleZ), 0xfde047, 8);
       }
-    }
+    } else {
+      // 2b. Player Horizontal Physics Control (Temple Run 3-Lane Responsive Kinematics + Continuous Harmony)
+      const speedBoost = this.activePowerUp === 'speed' ? 1.38 : 1.0;
+      const stumbleSlowdown = this.stumbleTimer > 0 ? THREE.MathUtils.lerp(1.0, 0.58, this.stumbleTimer / 0.52) : 1.0;
+      const slideBoost = this.slideTimer > 0 ? 1.08 : 1.0;
+      const maxForwardSpeed = (input.sprint ? 13.4 : 11.2) * speedBoost * stumbleSlowdown * slideBoost;
+      const maxStrafeSpeed = 8.4 * speedBoost;
 
-    // Forgiving variable jump release (only after 100ms so quick taps still clear obstacles & hit blocks)
-    if (
-      !input.jumpHeld &&
-      this.jumpsUsed === 1 &&
-      this.jumpHoldTimer > 0.10 &&
-      this.playerBody.velocity.y > 7.8
-    ) {
-      this.playerBody.velocity.y *= 0.94;
-    }
-
-    // Snappy asymmetric fall pull so jumps feel athletic rather than floaty
-    if (!this.grounded && this.playerBody.velocity.y < 0) {
-      this.playerBody.velocity.y -= 11.5 * clampedDt;
-    }
-
-    // One-way Mario block collision: only solid on top when landing from above; never snag front/bottom edges!
-    const preFootY = this.playerBody.position.y - this.playerRadius;
-    const preStepVy = this.playerBody.velocity.y;
-    for (const o of this.obstacles) {
-      if (!o.alive || !o.body) continue;
-      if (o.spec.kind === 'mystery_block' || o.spec.kind === 'coin_box') {
-        const canStandOnTop = preFootY >= o.basePos.y + 0.44 && preStepVy <= 1.0;
-        o.body.collisionResponse = canStandOnTop;
-        o.body.collisionFilterGroup = canStandOnTop ? 1 : 4;
+      let moveX = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+      let moveZ = 0;
+      if (input.autoRun || input.sprint || this.slideTimer > 0) {
+        moveZ = -1;
+      } else {
+        moveZ = input.forward ? -1 : 0;
       }
-    }
 
-    // 4. Step Cannon-ES Physics World
-    this.world.step(1 / 60, clampedDt, 4);
+      const onIce = this.standingPlatform?.spec.kind === 'ice';
+      const accelGround = onIce ? 14 : 46;
+      const accelAir = 32;
+      const accel = this.grounded ? accelGround : accelAir;
 
-    // 5. Ground Check via Raycast + Contact Inspection
-    const footY = this.playerBody.position.y - this.playerRadius;
-    const rayFrom = new CANNON.Vec3(
-      this.playerBody.position.x,
-      this.playerBody.position.y,
-      this.playerBody.position.z
-    );
-    const rayTo = new CANNON.Vec3(
-      this.playerBody.position.x,
-      this.playerBody.position.y - this.playerRadius - 0.16,
-      this.playerBody.position.z
-    );
-    const rayResult = new CANNON.RaycastResult();
-    this.world.raycastClosest(
-      rayFrom,
-      rayTo,
-      { skipBackfaces: true, collisionFilterMask: 1 },
-      rayResult
-    );
-
-    this.grounded = false;
-    this.standingPlatform = null;
-    if (rayResult.hasHit && this.playerBody.velocity.y <= 2.5 && rayResult.hitNormalWorld.y > 0.55) {
-      this.grounded = true;
-      const hitBody = rayResult.body;
-      const plat = this.platforms.find((pl) => pl.body === hitBody) || null;
-      this.standingPlatform = plat;
-      if (plat && plat.spec.kind === 'crumbling' && plat.crumbleState === 'solid') {
-        plat.crumbleState = 'shaking';
-        plat.crumbleTimer = 0.65;
-      }
-      this.stompCombo = 0;
-    }
-
-    const speedHorizNow = Math.hypot(this.playerBody.velocity.x, this.playerBody.velocity.z);
-    if (this.grounded) {
-      const terrain = this.getCurrentTerrain();
-      if (!this.wasGrounded) {
-        if (this.elapsed > 0.25) {
-          soundEngine.footstep(terrain, 1.25);
+      let targetVx = moveX * maxStrafeSpeed;
+      if (this.laneModeActive) {
+        const ref = this.getCurrentLaneReference();
+        const targetLaneX = ref.centerX + this.currentLane * ref.spacing;
+        const errX = targetLaneX - this.playerBody.position.x;
+        // Critically damped Temple Run lane snap: quick, fluid, zero overshoot
+        targetVx = THREE.MathUtils.clamp(errX * 14.5, -13.5 * speedBoost, 13.5 * speedBoost);
+        if (Math.abs(errX) < 0.025) {
+          targetVx = 0;
         }
-        this.footstepAcc = 0;
-      } else if (speedHorizNow > 0.85) {
-        const stepInterval = THREE.MathUtils.clamp(
-          Math.PI / (5.4 + speedHorizNow * 0.88),
-          0.19,
-          0.38
-        );
-        this.footstepAcc += clampedDt;
-        if (this.footstepAcc >= stepInterval) {
-          this.footstepAcc -= stepInterval;
-          soundEngine.footstep(terrain, 0.85 + Math.min(0.3, speedHorizNow * 0.02));
+      }
+      const targetVz = moveZ * maxForwardSpeed;
+
+      const lateralBlend = this.laneModeActive
+        ? 1 - Math.exp(-(onIce ? 9 : 22) * clampedDt)
+        : Math.min(1, accel * clampedDt * (onIce ? 0.25 : 0.46));
+      const forwardBlend = Math.min(1, accel * clampedDt * (onIce ? 0.25 : 0.45));
+
+      this.playerBody.velocity.x = THREE.MathUtils.lerp(this.playerBody.velocity.x, targetVx, lateralBlend);
+      this.playerBody.velocity.z = THREE.MathUtils.lerp(this.playerBody.velocity.z, targetVz, forwardBlend);
+      // Character never runs backward (+Z); allow only brief stumble recoil impulse
+      if (this.stumbleTimer <= 0.34 && this.playerBody.velocity.z > 0) {
+        this.playerBody.velocity.z = 0;
+      }
+
+      // 3. Jump & Double Jump with Coyote Time, Buffer & Crisp Fall Gravity
+      if (this.grounded) {
+        this.coyoteTimer = 0.16;
+        this.jumpsUsed = 0;
+        this.jumpHoldTimer = 0;
+      } else {
+        if (this.coyoteTimer > 0) this.coyoteTimer -= clampedDt;
+        this.jumpHoldTimer += clampedDt;
+        this.prevAirVelY = this.playerBody.velocity.y;
+      }
+
+      if (this.jumpBufferTimer > 0) {
+        if (this.coyoteTimer > 0) {
+          this.playerBody.velocity.y = 13.8;
+          this.grounded = false;
+          this.coyoteTimer = 0;
+          this.jumpBufferTimer = 0;
+          this.jumpHoldTimer = 0;
+          this.jumpsUsed = 1;
+          this.slideTimer = 0;
+          this.pendingAirSlide = false;
+          soundEngine.jump();
+        } else if (this.jumpsUsed < 2) {
+          this.playerBody.velocity.y = 13.2;
+          this.jumpBufferTimer = 0;
+          this.jumpsUsed = 2;
+          this.flipAnimTimer = 0.52;
+          this.pendingAirSlide = false;
+          soundEngine.doubleJump();
+        }
+      }
+
+      // Forgiving variable jump release (only after 100ms so quick taps still clear obstacles & hit blocks)
+      if (
+        !input.jumpHeld &&
+        this.jumpsUsed === 1 &&
+        this.jumpHoldTimer > 0.10 &&
+        this.playerBody.velocity.y > 7.8
+      ) {
+        this.playerBody.velocity.y *= 0.94;
+      }
+
+      // Snappy asymmetric fall pull so jumps feel athletic rather than floaty
+      if (!this.grounded && this.playerBody.velocity.y < 0) {
+        this.playerBody.velocity.y -= 11.5 * clampedDt;
+      }
+
+      // One-way Mario block collision: only solid on top when landing from above; never snag front/bottom edges!
+      const preFootY = this.playerBody.position.y - this.playerRadius;
+      const preStepVy = this.playerBody.velocity.y;
+      for (const o of this.obstacles) {
+        if (!o.alive || !o.body) continue;
+        if (o.spec.kind === 'mystery_block' || o.spec.kind === 'coin_box') {
+          const canStandOnTop = preFootY >= o.basePos.y + 0.44 && preStepVy <= 1.0;
+          o.body.collisionResponse = canStandOnTop;
+          o.body.collisionFilterGroup = canStandOnTop ? 1 : 4;
+        }
+      }
+
+      // 4. Step Cannon-ES Physics World
+      this.world.step(1 / 60, clampedDt, 4);
+
+      // 5. Ground Check via Raycast + Contact Inspection
+      footY = this.playerBody.position.y - this.playerRadius;
+      const rayFrom = new CANNON.Vec3(
+        this.playerBody.position.x,
+        this.playerBody.position.y,
+        this.playerBody.position.z
+      );
+      const rayTo = new CANNON.Vec3(
+        this.playerBody.position.x,
+        this.playerBody.position.y - this.playerRadius - 0.16,
+        this.playerBody.position.z
+      );
+      const rayResult = new CANNON.RaycastResult();
+      this.world.raycastClosest(
+        rayFrom,
+        rayTo,
+        { skipBackfaces: true, collisionFilterMask: 1 },
+        rayResult
+      );
+
+      this.grounded = false;
+      this.standingPlatform = null;
+      if (rayResult.hasHit && this.playerBody.velocity.y <= 2.5 && rayResult.hitNormalWorld.y > 0.55) {
+        this.grounded = true;
+        const hitBody = rayResult.body;
+        const plat = this.platforms.find((pl) => pl.body === hitBody) || null;
+        this.standingPlatform = plat;
+        if (plat && plat.spec.kind === 'crumbling' && plat.crumbleState === 'solid') {
+          plat.crumbleState = 'shaking';
+          plat.crumbleTimer = 0.65;
+        }
+        this.stompCombo = 0;
+      }
+
+      const speedHorizNow = Math.hypot(this.playerBody.velocity.x, this.playerBody.velocity.z);
+      if (this.grounded) {
+        const terrain = this.getCurrentTerrain();
+        if (!this.wasGrounded) {
+          if (this.elapsed > 0.25) {
+            // Trigger realistic landing knee-absorption state & impact dust
+            this.landingImpact = THREE.MathUtils.clamp(-this.prevAirVelY / 16.5, 0.35, 1.0);
+            this.landingTimer = 0.18;
+            if (this.pendingAirSlide) {
+              this.pendingAirSlide = false;
+              this.slideTimer = this.slideDuration;
+              this.slideDustAcc = 0;
+              soundEngine.slide(terrain);
+            } else {
+              soundEngine.footstep(terrain, 1.15 + this.landingImpact * 0.25);
+            }
+            this.spawnRunTrail(
+              new THREE.Vector3(
+                this.playerBody.position.x,
+                footY + 0.06,
+                this.playerBody.position.z
+              ),
+              0xd6cbb8
+            );
+          }
+          this.footstepAcc = 0;
+        } else if (speedHorizNow > 0.85 && this.slideTimer <= 0) {
+          const stepInterval = THREE.MathUtils.clamp(
+            Math.PI / (4.9 + speedHorizNow * 0.84),
+            0.19,
+            0.38
+          );
+          this.footstepAcc += clampedDt;
+          if (this.footstepAcc >= stepInterval) {
+            this.footstepAcc -= stepInterval;
+            soundEngine.footstep(terrain, 0.85 + Math.min(0.3, speedHorizNow * 0.02));
+          }
+        } else {
+          this.footstepAcc = 0;
         }
       } else {
         this.footstepAcc = 0;
       }
-    } else {
-      this.footstepAcc = 0;
+      this.wasGrounded = this.grounded;
+
+      // 5b. Animate Idle Jungle Vines & Check Forgiving Airborne Vine Grab
+      const curPx = this.playerBody.position.x;
+      const curPz = this.playerBody.position.z;
+      const reachY = footY + 1.66;
+      for (const v of this.vines) {
+        v.angle = Math.sin(this.elapsed * v.spec.swingSpeed + v.spec.phase) * v.spec.swingAmp;
+        v.angVel =
+          Math.cos(this.elapsed * v.spec.swingSpeed + v.spec.phase) *
+          v.spec.swingAmp *
+          v.spec.swingSpeed;
+        v.vinePivot.rotation.x = v.angle;
+        v.glowRing.scale.setScalar(1 + Math.sin(this.elapsed * 4.4 + v.spec.phase) * 0.14);
+
+        if (!this.activeVine && this.vineReleaseCooldown <= 0 && !this.grounded) {
+          const L = v.spec.length;
+          const handleY = v.spec.anchorY - L * Math.cos(v.angle);
+          const handleZ = v.spec.z - L * Math.sin(v.angle);
+          const dx = Math.abs(curPx - v.spec.x);
+          const dy = Math.abs(reachY - (handleY + 0.45));
+          const dz = Math.abs(curPz - handleZ);
+          if (dx < 2.65 && dy < 2.45 && dz < 2.55) {
+            this.activeVine = v;
+            this.vineLateralX = THREE.MathUtils.clamp(curPx - v.spec.x, -1.3, 1.3);
+            const approxAngle = Math.asin(THREE.MathUtils.clamp((v.spec.z - curPz) / L, -0.82, 0.5));
+            v.angle = THREE.MathUtils.clamp(approxAngle, -0.78, 0.45);
+            const entryAngVel = Math.max(1.55, Math.min(2.75, -this.playerBody.velocity.z / L + 0.72));
+            v.angVel = Math.max(v.angVel, entryAngVel);
+            v.vinePivot.rotation.x = v.angle;
+            this.slideTimer = 0;
+            this.flipAnimTimer = 0;
+            this.jumpBufferTimer = 0;
+            this.jumpsUsed = 1;
+            soundEngine.vineGrab();
+            this.spawnBurst(new THREE.Vector3(v.spec.x + this.vineLateralX, handleY, handleZ), 0x4ade80, 10);
+            this.spawnBurst(new THREE.Vector3(v.spec.x + this.vineLateralX, handleY, handleZ), 0xfde047, 6);
+            break;
+          }
+        }
+      }
     }
-    this.wasGrounded = this.grounded;
 
     // 6. Update Obstacles & Collisions
     const px = this.playerBody.position.x;
@@ -2273,7 +3527,8 @@ export class LevelPhysicsRuntime {
     for (const o of this.obstacles) {
       if (!o.alive) continue;
       // Hide any block or obstacle immediately once the player crosses past it (moving toward -Z)
-      const crossMargin = o.spec.kind === 'sweeper' ? 2.2 : 1.05;
+      const crossMargin =
+        o.spec.kind === 'sweeper' ? 2.2 : o.spec.kind === 'blue_button' ? 3.2 : 1.05;
       if (o.basePos.z > pz + crossMargin) {
         o.alive = false;
         o.mesh.visible = false;
@@ -2293,15 +3548,15 @@ export class LevelPhysicsRuntime {
         if (blockMesh) {
           blockMesh.position.y = Math.sin(o.bounceAnim * Math.PI) * 0.35;
         }
-        // Bump from underneath without snagging!
+        // Bump from underneath without snagging (calibrated for 1.50x explorer head height)
         if (
           !o.used &&
           o.hitCooldown <= 0 &&
-          Math.abs(px - o.basePos.x) < 1.12 &&
+          Math.abs(px - o.basePos.x) < 1.15 &&
           Math.abs(pz - o.basePos.z) < 1.15 &&
-          py < o.basePos.y - 0.15 &&
-          py > o.basePos.y - 1.65 &&
-          (preStepVy > 0.5 || this.playerBody.velocity.y > 0.5)
+          py < o.basePos.y - 0.12 &&
+          py > o.basePos.y - 2.05 &&
+          this.playerBody.velocity.y > 0.5
         ) {
           o.bounceAnim = 1;
           o.hitCooldown = 0.25;
@@ -2313,12 +3568,30 @@ export class LevelPhysicsRuntime {
           if (o.spec.kind === 'coin_box') {
             o.hitsLeft = (o.hitsLeft ?? 1) - 1;
             callbacks.onCoin(3);
+            if (o.spec.reward === 'extra_life' && !o.extraLifeChecked) {
+              o.extraLifeChecked = true;
+              const addedLife = callbacks.onExtraLife?.() ?? false;
+              if (addedLife) {
+                this.extraLifeNoticeTimer = 2.4;
+                soundEngine.extraLife();
+                this.spawnBurst(
+                  new THREE.Vector3(o.basePos.x, o.basePos.y + 0.95, o.basePos.z),
+                  0xf43f5e,
+                  18
+                );
+                this.spawnBurst(
+                  new THREE.Vector3(o.basePos.x, o.basePos.y + 1.15, o.basePos.z),
+                  0xfef08a,
+                  10
+                );
+              }
+            }
             if (o.hitsLeft <= 0) {
               o.used = true;
             }
           } else {
             o.used = true;
-            if (o.spec.reward === 'coins' || !o.spec.reward) {
+            if (o.spec.reward === 'coins' || o.spec.reward === 'extra_life' || !o.spec.reward) {
               callbacks.onCoin(5);
             } else {
               this.activePowerUp = o.spec.reward;
@@ -2347,7 +3620,8 @@ export class LevelPhysicsRuntime {
 
           if (o.used && blockMesh && (blockMesh as THREE.Mesh).isMesh) {
             const m = (blockMesh as THREE.Mesh).material as THREE.MeshStandardMaterial;
-            m.color.setHex(0x78350f);
+            m.color.setHex(o.spec.reward === 'extra_life' ? 0x7f1d1d : 0x78350f);
+            m.emissiveIntensity = 0;
             m.map = null;
             m.needsUpdate = true;
           }
@@ -2363,6 +3637,65 @@ export class LevelPhysicsRuntime {
           soundEngine.powerUp();
           this.spawnBurst(new THREE.Vector3(o.basePos.x, o.basePos.y + 0.6, o.basePos.z), 0xef4444, 16);
           callbacks.onPowerUp('blaster');
+        }
+      } else if (o.spec.kind === 'blue_button') {
+        const capGroup = o.mesh.userData.buttonCap as THREE.Group | undefined;
+        const haloRing = o.mesh.userData.haloRing as THREE.Mesh | undefined;
+        const phase = (o.spec.phase ?? 0) + o.basePos.z * 0.2;
+
+        if (haloRing) {
+          const pulse = o.used ? 1.18 : 1 + Math.sin(this.elapsed * 4.5 + phase) * 0.1;
+          haloRing.scale.setScalar(pulse);
+        }
+
+        // Tactile push-down depression when stepped on / activated
+        if (capGroup) {
+          const targetY = o.used ? -0.17 : Math.sin(this.elapsed * 3.2 + phase) * 0.015;
+          capGroup.position.y = THREE.MathUtils.damp(capGroup.position.y, targetY, 18, clampedDt);
+        }
+
+        // Playful peeking Langoor bounce atop the blue button before being collected
+        if (o.armMesh && !o.used) {
+          o.armMesh.position.y = 0.58 + Math.abs(Math.sin(this.elapsed * 4.4 + phase)) * 0.16;
+          o.armMesh.rotation.y = Math.PI + Math.sin(this.elapsed * 2.2 + phase) * 0.35;
+        }
+
+        // Trigger when explorer steps on or hits the blue button
+        if (
+          !o.used &&
+          Math.hypot(px - o.basePos.x, pz - o.basePos.z) < 1.48 &&
+          Math.abs(footY - o.basePos.y) < 1.95
+        ) {
+          o.used = true;
+          o.bounceAnim = 1;
+          if (o.armMesh) {
+            o.armMesh.visible = false;
+          }
+          soundEngine.blueButtonPress();
+          soundEngine.langoorChirp();
+          // Crisp sky-blue & gold activation burst
+          this.spawnBurst(new THREE.Vector3(o.basePos.x, o.basePos.y + 0.55, o.basePos.z), 0x38bdf8, 16);
+          this.spawnBurst(new THREE.Vector3(o.basePos.x, o.basePos.y + 0.45, o.basePos.z), 0xfde047, 8);
+
+          if (!this.hasLangoorPet && !this.leapingLangoor) {
+            // Launch the Gray Langoor in a smooth leaping arc straight onto the explorer's right shoulder!
+            const leapRig = buildLangoorModel(0.95, true);
+            const startPos = new THREE.Vector3(o.basePos.x, o.basePos.y + 0.72, o.basePos.z);
+            leapRig.root.position.copy(startPos);
+            this.levelGroup.add(leapRig.root);
+            this.leapingLangoor = {
+              rig: leapRig,
+              startPos,
+              elapsed: 0,
+              duration: 0.42,
+            };
+            callbacks.onCoin(5);
+          } else {
+            // Already have the Langoor pet — pressing the second blue button cheers up the companion + bonus coins!
+            this.langoorCheerTimer = 1.05;
+            this.spawnBurst(new THREE.Vector3(px + 0.3, footY + 1.95, pz), 0x7dd3fc, 10);
+            callbacks.onCoin(10);
+          }
         }
       } else if (o.spec.kind === 'crate') {
         if (
@@ -2433,10 +3766,13 @@ export class LevelPhysicsRuntime {
       } else if (o.spec.kind === 'pendulum' && o.armMesh) {
         const swingAngle = Math.sin(this.elapsed * (1.8 + (o.spec.speed ?? 1) * 0.45) + (o.spec.phase ?? 0)) * 1.05;
         o.armMesh.rotation.z = swingAngle;
-        const maceX = o.basePos.x + Math.sin(swingAngle) * 3.65;
-        const maceY = o.basePos.y + 4.55 - Math.cos(swingAngle) * 3.65;
+        const maceX = o.basePos.x + Math.sin(swingAngle) * 4.1;
+        const maceY = o.basePos.y + 5.4 - Math.cos(swingAngle) * 4.1;
+        // Sliding lowers player's effective collision silhouette so 1.50x explorer can duck under high swings!
+        const hitCenterY = footY + 1.2;
+        const hitRad = 0.98;
         if (
-          Math.hypot(px - maceX, py - maceY) < 0.95 &&
+          Math.hypot(px - maceX, hitCenterY - maceY) < hitRad &&
           Math.abs(pz - o.basePos.z) < 0.95 &&
           o.hitCooldown <= 0
         ) {
@@ -2474,6 +3810,48 @@ export class LevelPhysicsRuntime {
     }
 
     if (this.boulderSpawnTimer > 0) this.boulderSpawnTimer -= clampedDt;
+    if (this.langoorCheerTimer > 0) {
+      this.langoorCheerTimer = Math.max(0, this.langoorCheerTimer - clampedDt);
+    }
+
+    // 6b. Update Leaping Langoor Pet parabolic arc onto explorer's right shoulder
+    if (this.leapingLangoor) {
+      const lp = this.leapingLangoor;
+      lp.elapsed += clampedDt;
+      const t = Math.min(1, lp.elapsed / lp.duration);
+      const ease = 1 - (1 - t) * (1 - t);
+      const shoulderX = px + 0.3;
+      const shoulderY = footY + 1.95;
+      const shoulderZ = pz;
+      const arcLift = Math.sin(t * Math.PI) * 1.45;
+      lp.rig.root.position.set(
+        THREE.MathUtils.lerp(lp.startPos.x, shoulderX, ease),
+        THREE.MathUtils.lerp(lp.startPos.y, shoulderY, ease) + arcLift,
+        THREE.MathUtils.lerp(lp.startPos.z, shoulderZ, ease)
+      );
+      lp.rig.root.rotation.y = THREE.MathUtils.lerp(Math.PI, 0, ease);
+      lp.rig.root.rotation.x = Math.sin(t * Math.PI) * 0.42;
+      lp.rig.leftArm.rotation.x = -1.65;
+      lp.rig.rightArm.rotation.x = -1.65;
+      lp.rig.tailPivot.rotation.x = -0.35 + Math.sin(t * Math.PI * 2) * 0.25;
+
+      if (t >= 1) {
+        this.levelGroup.remove(lp.rig.root);
+        lp.rig.root.traverse((obj) => {
+          if ((obj as THREE.Mesh).isMesh) {
+            const m = obj as THREE.Mesh;
+            m.geometry.dispose();
+            if (Array.isArray(m.material)) m.material.forEach((mat) => mat.dispose());
+            else m.material.dispose();
+          }
+        });
+        this.leapingLangoor = null;
+        this.hasLangoorPet = true;
+        this.langoorCheerTimer = 0.95;
+        this.spawnBurst(new THREE.Vector3(shoulderX, shoulderY + 0.16, shoulderZ), 0x7dd3fc, 10);
+        this.spawnBurst(new THREE.Vector3(shoulderX, shoulderY + 0.2, shoulderZ), 0xfde047, 6);
+      }
+    }
 
     // 7. Update Dynamic Rolling Boulders
     for (let i = this.boulders.length - 1; i >= 0; i--) {
@@ -2509,11 +3887,20 @@ export class LevelPhysicsRuntime {
       }
     }
 
-    // 7b. Update Monkey Eating & Single Banana-Throw Behavior
+    // 7b. Update Monkey Eating, Localized 3D Chatter & Single Banana-Throw Behavior
     for (const m of this.monkeys) {
       if (m.throwCooldown > 0) m.throwCooldown -= clampedDt;
       const dzAhead = pz - m.pos.z; // positive when monkey is ahead of player
       const nearRange = dzAhead > 2.2 && dzAhead < 17.5;
+
+      // Trigger localized 3D canopy monkey chatter as the player runs near/past this tree
+      if (!m.passByChattered && dzAhead > -3.5 && dzAhead < 19.5) {
+        const horizToMonkey = Math.hypot(px - m.pos.x, pz - m.pos.z);
+        if (horizToMonkey < 21.5) {
+          m.passByChattered = true;
+          soundEngine.playSpatialAnimalPassBy(m.audioId, 'monkey', m.pos, 1.0);
+        }
+      }
 
       // Always turn smoothly to look at the player using shortest-angle yaw
       const aimYaw = Math.atan2(px - m.pos.x, pz - m.pos.z);
@@ -2535,7 +3922,7 @@ export class LevelPhysicsRuntime {
           m.hasThrown = true;
           m.throwCooldown = 0.75;
           this.spawnThrownBanana(m, px, py + 0.4, pz);
-          soundEngine.monkeyChirp();
+          soundEngine.monkeyChirp(m.pos, `${m.audioId}_throw`);
         }
       } else {
         // Eating banana on the tree limb while watching the player
@@ -2568,7 +3955,9 @@ export class LevelPhysicsRuntime {
       tb.mesh.rotation.z += clampedDt * 8;
 
       let removeBanana = false;
-      if (Math.hypot(px - tb.pos.x, py + 0.3 - tb.pos.y, pz - tb.pos.z) < this.playerRadius + 0.45) {
+      const bananaHitY = this.slideTimer > 0 ? footY + 0.36 : py + 0.35;
+      const bananaHitRad = this.slideTimer > 0 ? this.playerRadius + 0.24 : this.playerRadius + 0.45;
+      if (Math.hypot(px - tb.pos.x, bananaHitY - tb.pos.y, pz - tb.pos.z) < bananaHitRad) {
         this.handlePlayerHazardHit(tb.pos, callbacks.onHurt);
         this.spawnBurst(tb.pos, 0xfacc15, 10);
         removeBanana = true;
@@ -2688,13 +4077,14 @@ export class LevelPhysicsRuntime {
       }
     }
 
-    // 8. Collect Coins (with Magnet pull!)
+    // 8. Collect Coins (with Magnet pull & 1.50x tall explorer reach!)
     const magnetRange = this.activePowerUp === 'magnet' ? 7.5 : 0;
+    const coinCollectRadius = this.activeVine ? 1.85 : 1.35;
     for (const c of this.coins) {
       if (c.collected) continue;
       c.mesh.rotation.y = this.elapsed * 3.2 + c.spinOffset;
       const dx = px - c.pos.x;
-      const dy = py + 0.5 - c.pos.y;
+      const dy = footY + 1.08 - c.pos.y;
       const dz = pz - c.pos.z;
       const d = Math.hypot(dx, dy, dz);
 
@@ -2708,7 +4098,7 @@ export class LevelPhysicsRuntime {
         c.mesh.position.y = c.pos.y + Math.sin(this.elapsed * 3 + c.spinOffset) * 0.12;
       }
 
-      if (d < 1.15) {
+      if (d < coinCollectRadius) {
         c.collected = true;
         c.mesh.visible = false;
         soundEngine.coin();
@@ -2721,12 +4111,18 @@ export class LevelPhysicsRuntime {
     for (let i = this.particles.length - 1; i >= 0; i--) {
       const pt = this.particles[i];
       pt.life -= clampedDt;
-      pt.vel.y -= 16 * clampedDt;
+      pt.vel.y -= (pt.gravity ?? 16) * clampedDt;
       pt.mesh.position.addScaledVector(pt.vel, clampedDt);
-      const s = Math.max(0.01, pt.life / pt.maxLife);
-      pt.mesh.scale.setScalar(s);
+      const frac = Math.max(0.01, pt.life / pt.maxLife);
+      pt.mesh.scale.setScalar(frac * (pt.baseScale ?? 1));
+      if (pt.baseOpacity !== undefined) {
+        (pt.mesh.material as THREE.MeshBasicMaterial).opacity = frac * pt.baseOpacity;
+      }
       if (pt.life <= 0) {
         this.levelGroup.remove(pt.mesh);
+        if (pt.disposeMat) {
+          (pt.mesh.material as THREE.Material).dispose();
+        }
         this.particles.splice(i, 1);
       }
     }
@@ -2773,6 +4169,10 @@ export class LevelPhysicsRuntime {
     }
 
     this.ambientWildlife.step(clampedDt, px, py, pz, rainStrength, this.elapsed);
+    this.surpriseAnimal.step(clampedDt, px, footY, pz, (pos, hex, count) =>
+      this.spawnBurst(pos, hex, count)
+    );
+    this.updateFallingLeaves(clampedDt, px, py, pz);
 
     if (this.goalRing) {
       this.goalRing.rotation.y += clampedDt * 1.4;
@@ -2792,6 +4192,26 @@ export class LevelPhysicsRuntime {
       velY: this.playerBody.velocity.y,
       strafeVelX: this.playerBody.velocity.x,
       footY,
+      lane: this.currentLane,
+      laneSwitchDir: this.laneSwitchDir,
+      laneSwitchProgress:
+        this.laneSwitchTimer > 0
+          ? 1 - this.laneSwitchTimer / this.laneSwitchDuration
+          : 0,
+      isSliding: this.slideTimer > 0,
+      slideProgress:
+        this.slideTimer > 0 ? 1 - this.slideTimer / this.slideDuration : 0,
+      jumpAnticipation:
+        this.jumpAnticipationTimer > 0 ? this.jumpAnticipationTimer / 0.06 : 0,
+      landingTimer: this.landingTimer,
+      landingImpact: this.landingImpact,
+      stumbleTimer: this.stumbleTimer,
+      stumbleDir: this.stumbleDir,
+      isSwinging: Boolean(this.activeVine),
+      vineAngle: this.activeVine?.angle ?? 0,
+      vineAngVel: this.activeVine?.angVel ?? 0,
+      hasLangoorPet: this.hasLangoorPet,
+      langoorCheerTimer: this.langoorCheerTimer,
     };
   }
 
@@ -2799,7 +4219,215 @@ export class LevelPhysicsRuntime {
     const clampedDt = Math.min(dt, 0.05);
     this.elapsed += clampedDt;
     this.textures.waterTexture.offset.y -= clampedDt * 0.08;
+    this.updateVegetationWind(clampedDt, 0, -4, 0.22);
+    this.updateFallingLeaves(clampedDt, 0, 1.5, -4);
+    for (const v of this.vines) {
+      v.angle = Math.sin(this.elapsed * v.spec.swingSpeed + v.spec.phase) * v.spec.swingAmp;
+      v.vinePivot.rotation.x = v.angle;
+      v.glowRing.scale.setScalar(1 + Math.sin(this.elapsed * 4.4 + v.spec.phase) * 0.14);
+    }
     this.ambientWildlife.step(clampedDt, 0, -999, 999, rainStrength, this.elapsed);
+  }
+
+  public updateFoliageWind(
+    dt: number,
+    weatherMode: WeatherMode,
+    activeWeather: WeatherKind,
+    rainStrength: number,
+    mistStrength: number
+  ) {
+    this.foliageWind.update(dt, weatherMode, activeWeather, rainStrength, mistStrength);
+  }
+
+  private updateVegetationWind(
+    clampedDt: number,
+    pCurX: number,
+    pCurZ: number,
+    speedFactor: number
+  ) {
+    // Macro spring sway scaled gently with weather wind (fine per-vertex leaf & branch wind runs on GPU)
+    const windScale = this.foliageWind.getWindScale();
+    const gustWave = (Math.sin(this.elapsed * 0.85) * 0.35 + 0.72) * windScale * 0.65;
+
+    // Subtle ambient breeze + pass-by spring reactivity on bushes, twigs & monkey tree canopies
+    for (const s of this.swayNodes) {
+      const distSq = (pCurX - s.worldX) * (pCurX - s.worldX) + (pCurZ - s.worldZ) * (pCurZ - s.worldZ);
+      let targetWake = 0;
+      if (distSq < 81) {
+        const dist = Math.sqrt(distSq);
+        targetWake = (1 - dist / 9) * 0.24 * speedFactor;
+      }
+      const force = (targetWake - s.wake) * 42 - s.wakeVel * 8.5;
+      s.wakeVel += force * clampedDt;
+      s.wake += s.wakeVel * clampedDt;
+
+      const breezeZ = Math.sin(this.elapsed * s.speed + s.phase) * s.amp * gustWave;
+      const breezeX = Math.cos(this.elapsed * s.speed * 0.8 + s.phase) * (s.amp * 0.68) * gustWave;
+      s.obj.rotation.z = s.baseRotZ + breezeZ - s.side * s.wake;
+      s.obj.rotation.x = s.baseRotX + breezeX - Math.abs(s.wake) * 0.55;
+    }
+
+    // Wind & pass-by reactivity on nearby canyon jungle trees & multi-tier overlapping canopies
+    if (this.sceneryTrunks && this.sceneryCanopies) {
+      let updatedTrees = false;
+      const dum = this.swayDummy;
+      const clustersPerTree = this.canopyClustersPerTree;
+      const cullRange = this.graphicsQuality === 'low' ? 24 : 34;
+
+      for (let i = 0; i < this.sceneryTreeData.length; i++) {
+        const td = this.sceneryTreeData[i];
+        const dz = Math.abs(td.z - pCurZ);
+        if (dz > cullRange && Math.abs(td.bend) < 0.002 && Math.abs(td.bendVel) < 0.002) continue;
+
+        let targetBend = 0;
+        if (dz < 14) {
+          const dist = Math.hypot(pCurX - td.x, pCurZ - td.z);
+          if (dist < 18) {
+            targetBend = (1 - dist / 18) * 0.075 * speedFactor;
+          }
+        }
+        const f = (targetBend - td.bend) * 28 - td.bendVel * 6.5;
+        td.bendVel += f * clampedDt;
+        td.bend += td.bendVel * clampedDt;
+
+        const breeze =
+          (Math.sin(this.elapsed * 1.38 + td.phase) * 0.026 +
+            Math.sin(this.elapsed * 2.4 + td.z * 0.09) * 0.011) *
+          gustWave;
+        const swayZ = td.side * -0.08 + breeze - td.side * td.bend;
+        const swayX = Math.cos(this.elapsed * 1.12 + td.phase) * 0.017 * gustWave - td.bend * 0.55;
+
+        dum.position.set(td.x, td.y + 4.2 * td.scale, td.z);
+        dum.scale.set(td.scale, td.scale, td.scale);
+        dum.rotation.set(swayX, td.rotY, swayZ);
+        dum.updateMatrix();
+        this.sceneryTrunks.setMatrixAt(i, dum.matrix);
+
+        const crownH = 4.4 * td.scale;
+        const leanX = -Math.sin(swayZ - td.side * -0.08) * crownH;
+        const leanZ = Math.sin(swayX) * crownH;
+        const baseIdx = i * clustersPerTree;
+
+        // Cluster 0: Broad primary crown
+        dum.position.set(td.x + leanX, td.y + 8.7 * td.scale, td.z + leanZ);
+        dum.scale.set(td.scale * 1.44, td.scale * 0.92, td.scale * 1.44);
+        dum.rotation.set(swayX, i * 0.6, breeze - td.side * td.bend);
+        dum.updateMatrix();
+        this.sceneryCanopies.setMatrixAt(baseIdx, dum.matrix);
+
+        // Cluster 1: Overhanging canyon bough
+        dum.position.set(
+          td.x - td.side * 1.65 * td.scale + leanX * 0.88,
+          td.y + 7.7 * td.scale,
+          td.z + 0.85 + leanZ * 0.88
+        );
+        dum.scale.set(td.scale * 1.14, td.scale * 0.76, td.scale * 1.12);
+        dum.rotation.set(0.08 + swayX * 1.1, i * 0.9 + 1.1, td.side * 0.12 + breeze * 1.25 - td.side * td.bend);
+        dum.updateMatrix();
+        this.sceneryCanopies.setMatrixAt(baseIdx + 1, dum.matrix);
+
+        // Cluster 2: Sunlit upper crown tuft
+        dum.position.set(
+          td.x + td.side * 1.15 * td.scale + leanX * 1.08,
+          td.y + 9.45 * td.scale,
+          td.z - 0.95 + leanZ * 1.08
+        );
+        dum.scale.set(td.scale * 1.06, td.scale * 0.74, td.scale * 1.08);
+        dum.rotation.set(-0.06 + swayX * 1.2, i * 1.3 + 2.2, -td.side * 0.08 + breeze * 1.35 - td.side * td.bend);
+        dum.updateMatrix();
+        this.sceneryCanopies.setMatrixAt(baseIdx + 2, dum.matrix);
+
+        if (clustersPerTree >= 4) {
+          // Cluster 3: Lower shaded foliage shelf
+          dum.position.set(
+            td.x - td.side * 0.8 * td.scale + leanX * 0.75,
+            td.y + 6.7 * td.scale,
+            td.z - 1.35 + leanZ * 0.75
+          );
+          dum.scale.set(td.scale * 0.98, td.scale * 0.64, td.scale * 1.04);
+          dum.rotation.set(0.05 + swayX * 0.9, i * 1.7 + 0.4, td.side * 0.06 + breeze * 0.9 - td.side * td.bend);
+          dum.updateMatrix();
+          this.sceneryCanopies.setMatrixAt(baseIdx + 3, dum.matrix);
+        }
+        updatedTrees = true;
+      }
+      if (updatedTrees) {
+        this.sceneryTrunks.instanceMatrix.needsUpdate = true;
+        this.sceneryCanopies.instanceMatrix.needsUpdate = true;
+      }
+    }
+
+    if (this.sceneryBlades) {
+      let updatedBlades = false;
+      const dum = this.swayDummy;
+      for (let i = 0; i < this.sceneryBladeData.length; i++) {
+        const bd = this.sceneryBladeData[i];
+        const dz = Math.abs(bd.z - pCurZ);
+        if (dz > 24 && Math.abs(bd.bend) < 0.003 && Math.abs(bd.bendVel) < 0.003) continue;
+
+        let targetBend = 0;
+        if (dz < 11) {
+          const dist = Math.hypot(pCurX - bd.x, pCurZ - bd.z);
+          if (dist < 13) {
+            targetBend = (1 - dist / 13) * 0.22 * speedFactor;
+          }
+        }
+        const f = (targetBend - bd.bend) * 38 - bd.bendVel * 8.0;
+        bd.bendVel += f * clampedDt;
+        bd.bend += bd.bendVel * clampedDt;
+
+        const breeze = Math.sin(this.elapsed * 2.25 + bd.phase) * 0.095 * gustWave;
+        dum.position.set(bd.x, bd.y, bd.z);
+        dum.rotation.set(
+          bd.baseRotX - bd.bend * 0.6,
+          bd.baseRotY,
+          bd.baseRotZ + breeze - bd.side * bd.bend
+        );
+        dum.scale.set(1, bd.scaleY, 1);
+        dum.updateMatrix();
+        this.sceneryBlades.setMatrixAt(i, dum.matrix);
+        updatedBlades = true;
+      }
+      if (updatedBlades) {
+        this.sceneryBlades.instanceMatrix.needsUpdate = true;
+      }
+    }
+
+    if (this.sceneryFerns) {
+      let updatedFerns = false;
+      const dum = this.swayDummy;
+      for (let i = 0; i < this.sceneryFernData.length; i++) {
+        const fd = this.sceneryFernData[i];
+        const dz = Math.abs(fd.z - pCurZ);
+        if (dz > 26 && Math.abs(fd.bend) < 0.003 && Math.abs(fd.bendVel) < 0.003) continue;
+
+        let targetBend = 0;
+        if (dz < 12) {
+          const dist = Math.hypot(pCurX - fd.x, pCurZ - fd.z);
+          if (dist < 14) {
+            targetBend = (1 - dist / 14) * 0.18 * speedFactor;
+          }
+        }
+        const f = (targetBend - fd.bend) * 34 - fd.bendVel * 7.5;
+        fd.bendVel += f * clampedDt;
+        fd.bend += fd.bendVel * clampedDt;
+
+        const flutter = Math.sin(this.elapsed * 1.9 + fd.phase) * 0.085 * gustWave;
+        dum.position.set(fd.x, fd.y, fd.z);
+        dum.rotation.set(
+          fd.baseRotX + flutter * 0.7 - fd.bend * 0.5,
+          fd.baseRotY,
+          fd.baseRotZ + flutter - fd.side * fd.bend
+        );
+        dum.scale.setScalar(fd.scale);
+        dum.updateMatrix();
+        this.sceneryFerns.setMatrixAt(i, dum.matrix);
+        updatedFerns = true;
+      }
+      if (updatedFerns) {
+        this.sceneryFerns.instanceMatrix.needsUpdate = true;
+      }
+    }
   }
 
   public stepFinishCelebration(dt: number) {
@@ -2831,12 +4459,18 @@ export class LevelPhysicsRuntime {
     for (let i = this.particles.length - 1; i >= 0; i--) {
       const pt = this.particles[i];
       pt.life -= clampedDt;
-      pt.vel.y -= 14 * clampedDt;
+      pt.vel.y -= (pt.gravity ?? 14) * clampedDt;
       pt.mesh.position.addScaledVector(pt.vel, clampedDt);
-      const s = Math.max(0.01, pt.life / pt.maxLife);
-      pt.mesh.scale.setScalar(s);
+      const frac = Math.max(0.01, pt.life / pt.maxLife);
+      pt.mesh.scale.setScalar(frac * (pt.baseScale ?? 1));
+      if (pt.baseOpacity !== undefined) {
+        (pt.mesh.material as THREE.MeshBasicMaterial).opacity = frac * pt.baseOpacity;
+      }
       if (pt.life <= 0) {
         this.levelGroup.remove(pt.mesh);
+        if (pt.disposeMat) {
+          (pt.mesh.material as THREE.Material).dispose();
+        }
         this.particles.splice(i, 1);
       }
     }
@@ -2845,13 +4479,21 @@ export class LevelPhysicsRuntime {
   private handlePlayerHazardHit(hazardPos: THREE.Vector3, onHurt: () => void) {
     if (this.invulnTimer > 0) return;
 
-    // Knockback impulse away from hazard
+    // Realistic Temple Run stumble recoil (cushioned lateral nudge + brief speed dip, not robotic launch)
     const dx = this.playerBody.position.x - hazardPos.x;
     const dz = this.playerBody.position.z - hazardPos.z;
     const len = Math.max(0.1, Math.hypot(dx, dz));
-    this.playerBody.velocity.x = (dx / len) * 6.5;
-    this.playerBody.velocity.z = (dz / len) * 5.0 + 3.5;
-    this.playerBody.velocity.y = 7.5;
+    this.stumbleDir = dx >= 0 ? 1 : -1;
+    this.stumbleTimer = 0.52;
+    this.slideTimer = 0;
+
+    this.playerBody.velocity.x = (dx / len) * 4.2;
+    this.playerBody.velocity.z = Math.min(2.4, (dz / len) * 2.5 + 1.8);
+    if (this.grounded) {
+      this.playerBody.velocity.y = 3.2;
+    } else {
+      this.playerBody.velocity.y = Math.max(this.playerBody.velocity.y, 4.0);
+    }
 
     if (this.activePowerUp === 'shield') {
       this.activePowerUp = null;
@@ -2896,11 +4538,24 @@ export class LevelPhysicsRuntime {
       bestPlat.basePos.z + bestPlat.spec.depth * 0.2
     );
     this.playerBody.velocity.set(0, 0, 0);
+    this.currentLane = 0;
+    this.laneModeActive = true;
+    this.laneSwitchDir = 0;
+    this.laneSwitchTimer = 0;
+    this.slideTimer = 0;
+    this.pendingAirSlide = false;
+    this.stumbleTimer = 0;
+    this.landingTimer = 0;
+    this.activeVine = null;
+    this.vineReleaseCooldown = 0;
     this.invulnTimer = 1.6;
   }
 
   public dispose() {
+    this.leapingLangoor = null;
     this.ambientWildlife.dispose();
+    soundEngine.clearSpatialSources();
+    this.surpriseAnimal.dispose();
     this.coinGeo.dispose();
     this.coinMat.dispose();
     this.particleGeo.dispose();

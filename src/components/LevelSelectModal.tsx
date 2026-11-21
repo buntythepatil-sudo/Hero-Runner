@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { Lock, Play, RotateCcw, Star, Trophy, X } from 'lucide-react';
+import { Lock, Play, RotateCcw, Sparkles, Star, Trophy, X } from 'lucide-react';
 import { ALL_LEVELS } from '../data/levels';
+import { getFestivalForLevel } from '../engine/festivalSystem';
 import { BiomeType } from '../types/game';
 
 interface LevelSelectModalProps {
@@ -8,6 +9,7 @@ interface LevelSelectModalProps {
   highestUnlocked: number;
   levelStars: Record<number, number>;
   levelTopTimes: Record<number, number[]>;
+  festivalMode: boolean;
   onSelectLevel: (level: number) => void;
   onClose: () => void;
 }
@@ -36,6 +38,7 @@ export const LevelSelectModal: React.FC<LevelSelectModalProps> = ({
   highestUnlocked,
   levelStars,
   levelTopTimes,
+  festivalMode,
   onSelectLevel,
   onClose,
 }) => {
@@ -179,6 +182,14 @@ export const LevelSelectModal: React.FC<LevelSelectModalProps> = ({
                             <div className="truncate text-xs font-semibold text-stone-100">
                               {lvl.name}
                             </div>
+                            {festivalMode && (
+                              <div className="mt-0.5 flex items-center gap-1 text-[10px] font-bold text-amber-200 truncate">
+                                <Sparkles className="h-2.5 w-2.5 shrink-0 text-amber-300" />
+                                <span className="truncate">
+                                  {getFestivalForLevel(lvl.levelNumber).name}
+                                </span>
+                              </div>
+                            )}
                             <div className="mt-0.5 flex items-center justify-between gap-1 text-[10px] text-stone-400">
                               <span>{lvl.difficultyLabel}</span>
                               {bestTime !== undefined && (

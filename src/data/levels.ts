@@ -5,6 +5,7 @@ import {
   ObstacleKind,
   ObstacleSpec,
   PlatformSegmentSpec,
+  SwingVineSpec,
 } from '../types/game';
 
 function seededRandom(seed: number): () => number {
@@ -84,6 +85,7 @@ function buildLevel(levelNumber: number): LevelSpec {
   const platforms: PlatformSegmentSpec[] = [];
   const obstacles: ObstacleSpec[] = [];
   const coins: CoinSpec[] = [];
+  const vines: SwingVineSpec[] = [];
 
   // Starting safe plaza
   platforms.push({
@@ -113,7 +115,7 @@ function buildLevel(levelNumber: number): LevelSpec {
       id: `L${levelNumber}_start_coinbox`,
       kind: 'coin_box',
       x: -1.7,
-      y: 3.65,
+      y: 4.05,
       z: -12,
       width: 10,
       reward: 'coins',
@@ -122,7 +124,7 @@ function buildLevel(levelNumber: number): LevelSpec {
       id: `L${levelNumber}_start_mystery`,
       kind: 'mystery_block',
       x: 1.7,
-      y: 3.65,
+      y: 4.05,
       z: -12,
       width: 10,
       reward: 'blaster',
@@ -143,6 +145,10 @@ function buildLevel(levelNumber: number): LevelSpec {
   let segIndex = 0;
   let obsIndex = 0;
   let coinIndex = 0;
+  let vineIndex = 0;
+  const maxVinesForLevel =
+    levelNumber < 6 ? 0 : levelNumber < 14 ? 2 : levelNumber < 26 ? 3 : 4;
+  let lastVineSeg = -3;
 
   while (cursorZ > -courseLength + 24) {
     segIndex++;
@@ -150,46 +156,100 @@ function buildLevel(levelNumber: number): LevelSpec {
 
     // Decide gap probability & gap length (increases progressively!)
     const gapChance = Math.min(0.68, 0.16 + difficulty * 0.52);
-    const hasGap = segIndex > 1 && rand() < gapChance;
+    const canPlaceVineChasm =
+      maxVinesForLevel > 0 &&
+      vineIndex < maxVinesForLevel &&
+      segIndex >= 3 &&
+      segIndex - lastVineSeg >= 3 &&
+      cursorZ > -courseLength + 52;
+    const forceVineChasm =
+      canPlaceVineChasm &&
+      Math.abs(cursorZ) >= ((vineIndex + 0.72) / (maxVinesForLevel + 0.6)) * courseLength;
+    const hasGap = forceVineChasm || (segIndex > 1 && rand() < gapChance);
 
+    let placedVineHere = false;
     if (hasGap) {
-      const gapLen = 2.6 + difficulty * 2.5 + rand() * 1.4;
-      // Place a coin arc over the chasm to guide the jump
-      const arcMidZ = cursorZ - gapLen * 0.5;
-      coins.push({
-        id: `L${levelNumber}_c_${coinIndex++}`,
-        x: 0,
-        y: currentY + 2.6,
-        z: arcMidZ,
-        value: 2,
-      });
-      cursorZ -= gapLen;
+      if (forceVineChasm || (canPlaceVineChasm && rand() < 0.34)) {
+        // Large dramatic canyon gap requiring the player to grab and swing across a jungle vine!
+        const prevPlat = platforms[platforms.length - 1];
+        const vineX = prevPlat ? prevPlat.x * 0.5 : 0;
+        const vineGapLen = 10.6 + difficulty * 2.4 + rand() * 1.1;
+        const gapMidZ = cursorZ - vineGapLen * 0.5;
+        const vineLength = 6.3;
+        const anchorY = currentY + 9.45;
+
+        vines.push({
+          id: `L${levelNumber}_vine_${vineIndex++}`,
+          x: vineX,
+          anchorY,
+          z: gapMidZ,
+          length: vineLength,
+          swingAmp: 0.44 + difficulty * 0.12,
+          swingSpeed: 1.82 + difficulty * 0.32,
+          phase: rand() * Math.PI * 2,
+        });
+        lastVineSeg = segIndex;
+        placedVineHere = true;
+
+        // Sweeping golden coin arc guiding jump -> grab -> swing release!
+        for (let k = -2; k <= 2; k++) {
+          const arcT = k / 2; // -1..1
+          const cz = gapMidZ - arcT * (vineGapLen * 0.36);
+          const cy = currentY + 2.8 + (1 - arcT * arcT) * 1.65;
+          coins.push({
+            id: `L${levelNumber}_c_${coinIndex++}`,
+            x: vineX,
+            y: cy,
+            z: cz,
+            value: 2,
+          });
+        }
+        cursorZ -= vineGapLen;
+      } else {
+        const gapLen = 2.6 + difficulty * 2.5 + rand() * 1.4;
+        // Place a coin arc over the chasm to guide the jump
+        const arcMidZ = cursorZ - gapLen * 0.5;
+        coins.push({
+          id: `L${levelNumber}_c_${coinIndex++}`,
+          x: 0,
+          y: currentY + 2.8,
+          z: arcMidZ,
+          value: 2,
+        });
+        cursorZ -= gapLen;
+      }
     }
 
-    // Decide elevation change
+    // Decide elevation change (keep vine-landing platform level or slightly forgiving)
     let deltaY = 0;
-    if (levelNumber >= 2 && rand() < 0.35 + difficulty * 0.25) {
+    if (placedVineHere) {
+      deltaY = 0;
+    } else if (levelNumber >= 2 && rand() < 0.35 + difficulty * 0.25) {
       deltaY = (rand() < 0.58 ? 1 : -1) * (0.9 + rand() * 1.3);
       currentY = Math.max(-2.5, Math.min(8.5, currentY + deltaY));
     }
 
-    // Platform type progression
+    // Platform type progression (after a vine swing, guarantee a solid forgiving landing cliff)
     let kind: PlatformSegmentSpec['kind'] = 'ground';
-    let segDepth = 14 + rand() * 10 - difficulty * 3.5;
-    let segWidth = baseWidth + (rand() - 0.5) * 1.2;
-    let offsetX = levelNumber >= 3 ? (rand() - 0.5) * (1.8 + difficulty * 3.0) : 0;
+    let segDepth = placedVineHere ? Math.max(12, 15 - difficulty * 2.0) : 14 + rand() * 10 - difficulty * 3.5;
+    let segWidth = placedVineHere ? Math.max(5.8, baseWidth + 0.8) : baseWidth + (rand() - 0.5) * 1.2;
+    let offsetX = placedVineHere
+      ? vines[vines.length - 1]?.x ?? 0
+      : levelNumber >= 3
+      ? (rand() - 0.5) * (1.8 + difficulty * 3.0)
+      : 0;
 
-    if (levelNumber >= 5 && roll < 0.18 + difficulty * 0.16) {
+    if (!placedVineHere && levelNumber >= 5 && roll < 0.18 + difficulty * 0.16) {
       kind = 'moving';
       segDepth = 6.5 + rand() * 3;
       segWidth = Math.max(3.6, baseWidth * 0.72);
-    } else if (levelNumber >= 6 && roll >= 0.18 && roll < 0.32 + difficulty * 0.12) {
+    } else if (!placedVineHere && levelNumber >= 6 && roll >= 0.18 && roll < 0.32 + difficulty * 0.12) {
       kind = 'crumbling';
       segDepth = 5.5 + rand() * 2.5;
       segWidth = Math.max(3.6, baseWidth * 0.68);
-    } else if (biome === 'waterfall' && roll >= 0.32 && roll < 0.52) {
+    } else if (!placedVineHere && biome === 'waterfall' && roll >= 0.32 && roll < 0.52) {
       kind = 'ice';
-    } else if (levelNumber >= 3 && roll >= 0.52 && roll < 0.66) {
+    } else if (!placedVineHere && levelNumber >= 3 && roll >= 0.52 && roll < 0.66) {
       kind = 'bridge';
       segWidth = Math.max(3.1, baseWidth * 0.62);
     }
@@ -265,7 +325,7 @@ function buildLevel(levelNumber: number): LevelSpec {
         };
 
         if (chosenKind === 'mystery_block') {
-          obs.y = platTopY + 2.55;
+          obs.y = platTopY + 2.95;
           const r = rand();
           obs.reward = r < 0.42 ? 'blaster' : r < 0.65 ? 'coins' : r < 0.8 ? 'shield' : r < 0.92 ? 'magnet' : 'speed';
           coins.push({
@@ -276,7 +336,7 @@ function buildLevel(levelNumber: number): LevelSpec {
             value: 2,
           });
         } else if (chosenKind === 'coin_box') {
-          obs.y = platTopY + 2.55;
+          obs.y = platTopY + 2.95;
           obs.reward = 'coins';
           coins.push({
             id: `L${levelNumber}_c_${coinIndex++}`,
@@ -360,6 +420,86 @@ function buildLevel(levelNumber: number): LevelSpec {
     });
   }
 
+  // Place EXACTLY TWO Blue Water Tanks per level (each spawns/celebrates the shoulder Langoor pet!)
+  const courseSpan = Math.max(40, Math.abs(goalPlatZ));
+  const targetFractions = [0.24, 0.66];
+  const candidatePlats = platforms.filter(
+    (p) =>
+      p.id !== `L${levelNumber}_goal` &&
+      p.kind !== 'moving' &&
+      p.depth >= 6.5
+  );
+  const usedTankPlatIds = new Set<string>();
+
+  targetFractions.forEach((frac, tankIdx) => {
+    const targetZ = -courseSpan * frac;
+    let bestPlat =
+      candidatePlats.find((p) => !usedTankPlatIds.has(p.id)) ?? platforms[0];
+    let bestDist = Infinity;
+    for (const p of candidatePlats) {
+      if (usedTankPlatIds.has(p.id)) continue;
+      const d = Math.abs(p.z - targetZ);
+      if (d < bestDist) {
+        bestDist = d;
+        bestPlat = p;
+      }
+    }
+    usedTankPlatIds.add(bestPlat.id);
+
+    const tankZ = bestPlat.z;
+    const laneOffset =
+      bestPlat.width >= 5.2
+        ? (tankIdx === 0 ? -1 : 1) * Math.min(1.45, bestPlat.width * 0.22)
+        : 0;
+    const tankX = bestPlat.x + laneOffset;
+    const tankY = bestPlat.y + bestPlat.height * 0.5;
+
+    // Clear any overlapping obstacles right around the blue button for a clean approach
+    for (let oi = obstacles.length - 1; oi >= 0; oi--) {
+      if (Math.abs(obstacles[oi].z - tankZ) < 2.8) {
+        obstacles.splice(oi, 1);
+      }
+    }
+
+    obstacles.push({
+      id: `L${levelNumber}_blue_button_${tankIdx + 1}`,
+      kind: 'blue_button',
+      x: tankX,
+      y: tankY,
+      z: tankZ,
+      width: bestPlat.width,
+      scale: 1,
+      phase: tankIdx * Math.PI,
+    });
+  });
+
+  // Hide an Extra Life inside exactly ONE coin block per level (preferring mid-to-late course coin blocks)
+  const courseCoinBoxes = obstacles.filter((o) => o.kind === 'coin_box' && o.z < -22);
+  if (courseCoinBoxes.length > 0) {
+    const startIdx = Math.floor(courseCoinBoxes.length * 0.35);
+    const pickIdx =
+      startIdx + Math.floor(rand() * Math.max(1, courseCoinBoxes.length - startIdx));
+    courseCoinBoxes[Math.min(courseCoinBoxes.length - 1, pickIdx)].reward = 'extra_life';
+  } else {
+    // Guarantee at least one course coin block carries the extra life on every level
+    const fallbackPlat =
+      candidatePlats[Math.floor(candidatePlats.length * 0.55)] ?? platforms[Math.min(2, platforms.length - 1)];
+    if (fallbackPlat) {
+      obstacles.push({
+        id: `L${levelNumber}_extra_life_coinbox`,
+        kind: 'coin_box',
+        x: fallbackPlat.x,
+        y: fallbackPlat.y + fallbackPlat.height * 0.5 + 2.95,
+        z: fallbackPlat.z,
+        width: fallbackPlat.width,
+        reward: 'extra_life',
+      });
+    } else {
+      const startBox = obstacles.find((o) => o.kind === 'coin_box');
+      if (startBox) startBox.reward = 'extra_life';
+    }
+  }
+
   return {
     levelNumber,
     name: LEVEL_NAMES[levelNumber - 1] ?? `Stage ${levelNumber}`,
@@ -373,6 +513,7 @@ function buildLevel(levelNumber: number): LevelSpec {
     platforms,
     obstacles,
     coins,
+    vines,
     goalZ: goalPlatZ - 4,
     goalY: currentY + 1.1,
   };

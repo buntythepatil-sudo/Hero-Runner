@@ -32,6 +32,9 @@ interface WildlifeAgent {
   flapRateIdle: number;
   flapRateScatter: number;
   scatterRadius: number;
+  passByRadius: number;
+  audioId: string;
+  passByTriggered: boolean;
   state: 'idle' | 'scattering' | 'gone';
   scatterElapsed: number;
   scatterDuration: number;
@@ -502,6 +505,9 @@ export class AmbientWildlifeSystem {
             flapRateIdle: 8.5 + rand() * 3.0,
             flapRateScatter: 19 + rand() * 4,
             scatterRadius: 4.9,
+            passByRadius: 10.2,
+            audioId: `wl_${levelNumber}_bf_${butterflyIdx}_${c}`,
+            passByTriggered: false,
             state: 'idle',
             scatterElapsed: 0,
             scatterDuration: 3.2,
@@ -542,6 +548,9 @@ export class AmbientWildlifeSystem {
           flapRateIdle: 0,
           flapRateScatter: 16.5 + rand() * 3,
           scatterRadius: 6.4,
+          passByRadius: 17.5,
+          audioId: `wl_${levelNumber}_parrot_${parrotIdx}`,
+          passByTriggered: false,
           state: 'idle',
           scatterElapsed: 0,
           scatterDuration: 4.1,
@@ -585,6 +594,9 @@ export class AmbientWildlifeSystem {
           flapRateIdle: 26,
           flapRateScatter: 34,
           scatterRadius: 5.5,
+          passByRadius: 12.0,
+          audioId: `wl_${levelNumber}_hum_${humIdx}`,
+          passByTriggered: false,
           state: 'idle',
           scatterElapsed: 0,
           scatterDuration: 2.8,
@@ -615,6 +627,17 @@ export class AmbientWildlifeSystem {
         const dy = a.pos.y - playerY;
         const dz = a.pos.z - playerZ;
         const distHoriz = Math.hypot(dx, dz);
+
+        // Trigger localized 3D pass-by vocalization / wing flutter as runner approaches
+        if (
+          !a.passByTriggered &&
+          distHoriz < a.passByRadius &&
+          distHoriz >= a.scatterRadius &&
+          Math.abs(dy) < 6.5
+        ) {
+          a.passByTriggered = true;
+          soundEngine.playSpatialAnimalPassBy(a.audioId, a.kind, a.pos, 1.0);
+        }
 
         if (distHoriz < a.scatterRadius && Math.abs(dy) < 4.8) {
           a.state = 'scattering';
@@ -649,7 +672,7 @@ export class AmbientWildlifeSystem {
             );
           }
 
-          soundEngine.wildlifeScatter(a.kind);
+          soundEngine.wildlifeScatter(a.kind, a.pos, a.audioId);
           continue;
         }
 
@@ -723,6 +746,10 @@ export class AmbientWildlifeSystem {
           a.leftWingPivot.rotation.z = flap;
           a.rightWingPivot.rotation.z = -flap;
         }
+
+        if (a.passByTriggered) {
+          soundEngine.updateSpatialSourcePosition(a.audioId, a.pos);
+        }
       } else {
         // Scattering flight state
         a.scatterElapsed += clampedDt;
@@ -748,6 +775,7 @@ export class AmbientWildlifeSystem {
         }
 
         a.root.position.copy(a.pos);
+        soundEngine.updateSpatialSourcePosition(a.audioId, a.pos);
         a.root.rotation.y = Math.atan2(-a.vel.x, -a.vel.z);
         a.bodyPivot.rotation.x = a.kind === 'parrot' ? -0.38 : -0.15;
         a.bodyPivot.rotation.z = THREE.MathUtils.clamp(-a.vel.x * 0.08, -0.45, 0.45);

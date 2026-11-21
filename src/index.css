@@ -30,6 +30,65 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* Premium Glassmorphism HUD & Modal Surfaces */
+.hud-glass {
+  background: linear-gradient(
+    145deg,
+    rgba(16, 42, 31, 0.76) 0%,
+    rgba(9, 25, 19, 0.84) 100%
+  );
+  border: 1px solid rgba(255, 255, 255, 0.19);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.28),
+    0 10px 24px -6px rgba(0, 0, 0, 0.48);
+  -webkit-backdrop-filter: blur(12px) saturate(130%);
+  backdrop-filter: blur(12px) saturate(130%);
+}
+
+.hud-glass-card {
+  background: linear-gradient(
+    160deg,
+    rgba(17, 44, 33, 0.86) 0%,
+    rgba(9, 24, 18, 0.93) 100%
+  );
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.2),
+    0 24px 48px -12px rgba(0, 0, 0, 0.65);
+  -webkit-backdrop-filter: blur(16px) saturate(135%);
+  backdrop-filter: blur(16px) saturate(135%);
+}
+
+/* Disable compositor blur on Low graphics mode for older Android GPUs */
+.low-gfx .hud-glass,
+.low-gfx .hud-glass-card {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  background: rgba(12, 30, 23, 0.94);
+}
+
+/* Glowing Emerald-to-Gold Progress Bar */
+.progress-bar-glow {
+  background: linear-gradient(
+    90deg,
+    #059669 0%,
+    #34d399 45%,
+    #facc15 82%,
+    #fef08a 100%
+  );
+  box-shadow:
+    0 0 12px rgba(52, 211, 153, 0.55),
+    0 0 18px rgba(250, 204, 21, 0.45);
+}
+
+.safe-hud-pad {
+  padding-top: max(0.75rem, env(safe-area-inset-top));
+  padding-right: max(0.75rem, env(safe-area-inset-right));
+  padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+  padding-left: max(0.75rem, env(safe-area-inset-left));
+}
+
 /* Custom slim scrollbar for wardrobe/level grid */
 .custom-scroll::-webkit-scrollbar {
   width: 6px;

@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0d2b22" />
+      <stop offset="55%" stop-color="#0b1f18" />
+      <stop offset="100%" stop-color="#06120e" />
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="42%" r="55%">
+      <stop offset="0%" stop-color="#34d399" stop-opacity="0.32" />
+      <stop offset="65%" stop-color="#059669" stop-opacity="0.08" />
+      <stop offset="100%" stop-color="#059669" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="gold" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fef08a" />
+      <stop offset="45%" stop-color="#f59e0b" />
+      <stop offset="100%" stop-color="#b45309" />
+    </linearGradient>
+    <linearGradient id="emerald" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6ee7b7" />
+      <stop offset="50%" stop-color="#10b981" />
+      <stop offset="100%" stop-color="#047857" />
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#bg)" />
+  <rect width="512" height="512" rx="112" fill="url(#glow)" />
+
+  <!-- Outer carved temple compass ring -->
+  <circle cx="256" cy="256" r="196" fill="none" stroke="url(#gold)" stroke-width="14" opacity="0.92" />
+  <circle cx="256" cy="256" r="172" fill="none" stroke="#34d399" stroke-width="3" opacity="0.4" stroke-dasharray="10 12" />
+
+  <!-- Tropical leaf crown accents -->
+  <path d="M96 346 C72 260 118 176 196 150 C166 206 154 274 176 342 C142 356 116 358 96 346 Z" fill="url(#emerald)" opacity="0.88" />
+  <path d="M416 346 C440 260 394 176 316 150 C346 206 358 274 336 342 C370 356 396 358 416 346 Z" fill="url(#emerald)" opacity="0.88" />
+
+  <!-- Ancient stepped temple silhouette -->
+  <path d="M144 374 L172 308 L200 308 L216 260 L296 260 L312 308 L340 308 L368 374 Z" fill="#0f2f24" stroke="url(#gold)" stroke-width="6" stroke-linejoin="round" />
+  <rect x="234" y="314" width="44" height="60" rx="4" fill="#071812" stroke="#f59e0b" stroke-width="4" />
+
+  <!-- Explorer compass star crest -->
+  <polygon points="256,88 286,210 404,236 286,262 256,356 226,262 108,236 226,210" fill="url(#gold)" />
+  <polygon points="256,120 274,218 364,236 274,254 256,324 238,254 148,236 238,218" fill="#fef3c7" opacity="0.42" />
+  <circle cx="256" cy="236" r="24" fill="#0b1f18" stroke="#fde047" stroke-width="7" />
+  <circle cx="256" cy="236" r="9" fill="#34d399" />
+</svg>

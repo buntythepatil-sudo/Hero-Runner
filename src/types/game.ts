@@ -26,6 +26,16 @@ export type PowerUpType = 'shield' | 'magnet' | 'speed' | 'blaster';
 
 export type WeatherKind = 'clear' | 'mist' | 'rain';
 export type WeatherMode = 'auto' | WeatherKind;
+export type GraphicsQuality = 'low' | 'medium' | 'high';
+export type FestivalId =
+  | 'diwali'
+  | 'holi'
+  | 'uttarayan'
+  | 'halloween'
+  | 'christmas'
+  | 'lunar_new_year'
+  | 'hanami'
+  | 'eid';
 
 export type DailyMissionKind =
   | 'collect_coins'
@@ -92,6 +102,8 @@ export interface SaveData {
   autoRun: boolean;
   muted: boolean;
   weatherMode?: WeatherMode;
+  graphicsQuality?: GraphicsQuality;
+  festivalMode?: boolean;
   dailyMissions?: DailyMissionState;
 }
 
@@ -123,7 +135,8 @@ export type ObstacleKind =
   | 'coin_box'
   | 'crate'
   | 'pipe'
-  | 'spike_strip';
+  | 'spike_strip'
+  | 'blue_button';
 
 export interface ObstacleSpec {
   id: string;
@@ -136,7 +149,7 @@ export interface ObstacleSpec {
   patrolRange?: number;
   speed?: number;
   phase?: number;
-  reward?: 'coins' | 'shield' | 'magnet' | 'speed' | 'blaster';
+  reward?: 'coins' | 'shield' | 'magnet' | 'speed' | 'blaster' | 'extra_life';
 }
 
 export interface CoinSpec {
@@ -145,6 +158,17 @@ export interface CoinSpec {
   y: number;
   z: number;
   value: number;
+}
+
+export interface SwingVineSpec {
+  id: string;
+  x: number;
+  anchorY: number;
+  z: number;
+  length: number;
+  swingAmp: number;
+  swingSpeed: number;
+  phase: number;
 }
 
 export interface LevelSpec {
@@ -160,6 +184,7 @@ export interface LevelSpec {
   platforms: PlatformSegmentSpec[];
   obstacles: ObstacleSpec[];
   coins: CoinSpec[];
+  vines: SwingVineSpec[];
   goalZ: number;
   goalY: number;
 }
@@ -178,6 +203,12 @@ export interface LiveHudState {
   powerUpRemaining: number;
   stompCombo: number;
   weather: WeatherKind;
+  hasLangoorPet?: boolean;
+  onVine?: boolean;
+  surpriseAnimalName?: string | null;
+  extraLifeBanner?: boolean;
+  festivalId?: FestivalId | null;
+  festivalName?: string | null;
 }
 
 export interface LevelClearSummary {

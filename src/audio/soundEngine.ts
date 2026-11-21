@@ -66,8 +66,68 @@ export interface AmbientEnvState {
   rainLevel?: number;
 }
 
+export type SpatialAnimalKind = 'parrot' | 'monkey' | 'butterfly' | 'hummingbird';
+
+export interface Vec3Like {
+  x: number;
+  y: number;
+  z: number;
+}
+
+interface SpatialAnimalConfig {
+  refDistance: number;
+  maxDistance: number;
+  rolloffFactor: number;
+  cooldownSec: number;
+  maxAudibleDist: number;
+}
+
+const SPATIAL_ANIMAL_CONFIG: Record<SpatialAnimalKind, SpatialAnimalConfig> = {
+  parrot: {
+    refDistance: 4.2,
+    maxDistance: 36,
+    rolloffFactor: 1.35,
+    cooldownSec: 0.42,
+    maxAudibleDist: 34,
+  },
+  monkey: {
+    refDistance: 4.8,
+    maxDistance: 40,
+    rolloffFactor: 1.3,
+    cooldownSec: 0.55,
+    maxAudibleDist: 36,
+  },
+  butterfly: {
+    refDistance: 2.3,
+    maxDistance: 18,
+    rolloffFactor: 1.85,
+    cooldownSec: 0.32,
+    maxAudibleDist: 16,
+  },
+  hummingbird: {
+    refDistance: 2.8,
+    maxDistance: 22,
+    rolloffFactor: 1.65,
+    cooldownSec: 0.4,
+    maxAudibleDist: 20,
+  },
+};
+
+const MAX_ACTIVE_SPATIAL_VOICES = 10;
+
+interface ActiveSpatialSource {
+  id: string;
+  kind: SpatialAnimalKind;
+  panner: PannerNode;
+  busGain: GainNode;
+  endTime: number;
+  cleanupTimer: number | null;
+}
+
 interface AmbientGraph {
   masterGain: GainNode;
+  spatialMasterGain: GainNode;
+  spatialBus: GainNode;
   waterGain: GainNode;
   waterLowpass: BiquadFilterNode;
   waterSparkleGain: GainNode;
@@ -92,6 +152,16 @@ class SoundEngine {
   private nextBirdTime = 0;
   private nextCritterTime = 0;
   private lastWildlifeScatterAt = 0;
+
+  // Localized 3D audio listener & active positional animal source pool
+  private listenerPos: Vec3Like = { x: 0, y: 2.4, z: 1 };
+  private activeSpatialSources: Map<string, ActiveSpatialSource> = new Map();
+  private lastSpatialTriggerByKind: Record<SpatialAnimalKind, number> = {
+    parrot: -10,
+    monkey: -10,
+    butterfly: -10,
+    hummingbird: -10,
+  };
 
   private envState: Required<AmbientEnvState> = {
     biome: 'canopy',
@@ -372,6 +442,29 @@ class SoundEngine {
     echoDelay.connect(echoWet);
     echoWet.connect(masterGain);
 
+    // 4b. Localized 3D Jungle Wildlife Bus (Parrots, Monkeys, Butterflies, Hummingbirds)
+    const spatialMasterGain = ctx.createGain();
+    spatialMasterGain.gain.setValueAtTime(this._muted || this.pageHidden ? 0.0001 : 0.95, now);
+    spatialMasterGain.connect(ctx.destination);
+
+    const spatialBus = ctx.createGain();
+    spatialBus.gain.setValueAtTime(1.0, now);
+
+    // Subtle canopy reflection send so localized calls sit organically in the rainforest
+    const spatialEchoDelay = ctx.createDelay(0.4);
+    spatialEchoDelay.delayTime.setValueAtTime(0.145, now);
+    const spatialEchoFilter = ctx.createBiquadFilter();
+    spatialEchoFilter.type = 'lowpass';
+    spatialEchoFilter.frequency.setValueAtTime(2400, now);
+    const spatialEchoWet = ctx.createGain();
+    spatialEchoWet.gain.setValueAtTime(0.18, now);
+
+    spatialBus.connect(spatialMasterGain);
+    spatialBus.connect(spatialEchoDelay);
+    spatialEchoDelay.connect(spatialEchoFilter);
+    spatialEchoFilter.connect(spatialEchoWet);
+    spatialEchoWet.connect(spatialMasterGain);
+
     sources.push(waterSrc, sparkleSrc, insectSrc, breezeSrc);
     lfos.push(waterSurgeLfo, sparkleLfo, insectTrillLfo, insectSwellLfo, breezeLfo);
 
@@ -380,6 +473,8 @@ class SoundEngine {
 
     this.ambient = {
       masterGain,
+      spatialMasterGain,
+      spatialBus,
       waterGain,
       waterLowpass,
       waterSparkleGain,
@@ -463,6 +558,10 @@ class SoundEngine {
 
     const tc = 0.55;
     this.ambient.masterGain.gain.setTargetAtTime(activeMaster, now, 0.28);
+    const spatialPhaseMix =
+      phase === 'playing' ? 1.0 : phase === 'finishing' ? 0.65 : 0.14;
+    const activeSpatial = this._muted || this.pageHidden ? 0.0001 : spatialPhaseMix;
+    this.ambient.spatialMasterGain.gain.setTargetAtTime(activeSpatial, now, 0.18);
     const isActive = !(this._muted || this.pageHidden);
     if (this.musicMasterGain) {
       this.musicMasterGain.gain.setTargetAtTime(isActive ? 1.0 : 0.0001, now, 0.22);
@@ -675,17 +774,599 @@ class SoundEngine {
     });
   }
 
-  monkeyChirp() {
+  // ---------------------------------------------------------------------------
+  // 3D Positional Audio Listener & Localized Jungle Animal Sources
+  // ---------------------------------------------------------------------------
+
+  public updateListener(
+    posX: number,
+    posY: number,
+    posZ: number,
+    forwardX = 0,
+    forwardY = -0.15,
+    forwardZ = -1,
+    upX = 0,
+    upY = 1,
+    upZ = 0
+  ) {
+    this.listenerPos.x = posX;
+    this.listenerPos.y = posY;
+    this.listenerPos.z = posZ;
+
+    if (this._muted || !this.ctx || this.ctx.state !== 'running') return;
+    const listener = this.ctx.listener;
+    if (!listener) return;
+
+    const now = this.ctx.currentTime;
+    const smooth = 0.022;
+
+    if ('positionX' in listener && listener.positionX) {
+      listener.positionX.setTargetAtTime(posX, now, smooth);
+      listener.positionY.setTargetAtTime(posY, now, smooth);
+      listener.positionZ.setTargetAtTime(posZ, now, smooth);
+    } else if (typeof listener.setPosition === 'function') {
+      listener.setPosition(posX, posY, posZ);
+    }
+
+    if ('forwardX' in listener && listener.forwardX) {
+      listener.forwardX.setTargetAtTime(forwardX, now, smooth);
+      listener.forwardY.setTargetAtTime(forwardY, now, smooth);
+      listener.forwardZ.setTargetAtTime(forwardZ, now, smooth);
+      listener.upX.setTargetAtTime(upX, now, smooth);
+      listener.upY.setTargetAtTime(upY, now, smooth);
+      listener.upZ.setTargetAtTime(upZ, now, smooth);
+    } else if (typeof listener.setOrientation === 'function') {
+      listener.setOrientation(forwardX, forwardY, forwardZ, upX, upY, upZ);
+    }
+  }
+
+  private hashStringUnit(str: string): number {
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return ((h >>> 0) % 1000) / 1000;
+  }
+
+  private setPannerPosition(panner: PannerNode, pos: Vec3Like, now: number, smooth = 0) {
+    if ('positionX' in panner && panner.positionX) {
+      if (smooth > 0) {
+        panner.positionX.setTargetAtTime(pos.x, now, smooth);
+        panner.positionY.setTargetAtTime(pos.y, now, smooth);
+        panner.positionZ.setTargetAtTime(pos.z, now, smooth);
+      } else {
+        panner.positionX.setValueAtTime(pos.x, now);
+        panner.positionY.setValueAtTime(pos.y, now);
+        panner.positionZ.setValueAtTime(pos.z, now);
+      }
+    } else if (typeof panner.setPosition === 'function') {
+      panner.setPosition(pos.x, pos.y, pos.z);
+    }
+  }
+
+  private releaseSpatialSource(id: string) {
+    const existing = this.activeSpatialSources.get(id);
+    if (!existing) return;
+    if (existing.cleanupTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(existing.cleanupTimer);
+    }
+    try {
+      existing.busGain.disconnect();
+      existing.panner.disconnect();
+    } catch {
+      // Already disconnected
+    }
+    this.activeSpatialSources.delete(id);
+  }
+
+  private pruneExpiredSpatialSources(now: number) {
+    for (const [id, src] of this.activeSpatialSources.entries()) {
+      if (now >= src.endTime) {
+        this.releaseSpatialSource(id);
+      }
+    }
+  }
+
+  private allocateSpatialSource(
+    ctx: AudioContext,
+    id: string,
+    kind: SpatialAnimalKind,
+    pos: Vec3Like,
+    durationSec: number
+  ): ActiveSpatialSource | null {
+    const now = ctx.currentTime;
+    this.pruneExpiredSpatialSources(now);
+
+    if (this.activeSpatialSources.has(id)) {
+      this.releaseSpatialSource(id);
+    }
+
+    // Enforce voice cap by evicting the soonest-to-finish source
+    if (this.activeSpatialSources.size >= MAX_ACTIVE_SPATIAL_VOICES) {
+      let oldestId: string | null = null;
+      let earliestEnd = Infinity;
+      for (const [k, v] of this.activeSpatialSources.entries()) {
+        if (v.endTime < earliestEnd) {
+          earliestEnd = v.endTime;
+          oldestId = k;
+        }
+      }
+      if (oldestId) this.releaseSpatialSource(oldestId);
+    }
+
+    const cfg = SPATIAL_ANIMAL_CONFIG[kind];
+    const panner = ctx.createPanner();
+    try {
+      panner.panningModel = 'HRTF';
+    } catch {
+      panner.panningModel = 'equalpower';
+    }
+    panner.distanceModel = 'inverse';
+    panner.refDistance = cfg.refDistance;
+    panner.maxDistance = cfg.maxDistance;
+    panner.rolloffFactor = cfg.rolloffFactor;
+    panner.coneInnerAngle = 360;
+    panner.coneOuterAngle = 360;
+    panner.coneOuterGain = 1;
+    this.setPannerPosition(panner, pos, now);
+
+    const busGain = ctx.createGain();
+    busGain.gain.setValueAtTime(1.0, now);
+    busGain.connect(panner);
+    panner.connect(this.ambient ? this.ambient.spatialBus : ctx.destination);
+
+    const cleanupMs = Math.ceil((durationSec + 0.16) * 1000);
+    const cleanupTimer =
+      typeof window !== 'undefined'
+        ? window.setTimeout(() => {
+            this.releaseSpatialSource(id);
+          }, cleanupMs)
+        : null;
+
+    const entry: ActiveSpatialSource = {
+      id,
+      kind,
+      panner,
+      busGain,
+      endTime: now + durationSec + 0.12,
+      cleanupTimer,
+    };
+    this.activeSpatialSources.set(id, entry);
+    return entry;
+  }
+
+  public updateSpatialSourcePosition(id: string, pos: Vec3Like) {
+    if (this._muted || !this.ctx || this.ctx.state !== 'running') return;
+    const active = this.activeSpatialSources.get(id);
+    if (!active) return;
+    this.setPannerPosition(active.panner, pos, this.ctx.currentTime, 0.02);
+  }
+
+  public clearSpatialSources() {
+    const now = this.ctx?.currentTime ?? 0;
+    for (const [id, src] of this.activeSpatialSources.entries()) {
+      if (this.ctx) {
+        try {
+          src.busGain.gain.cancelScheduledValues(now);
+          src.busGain.gain.setTargetAtTime(0.0001, now, 0.02);
+        } catch {
+          // Ignore scheduling errors on closing contexts
+        }
+      }
+      this.releaseSpatialSource(id);
+    }
+    this.lastSpatialTriggerByKind.parrot = -10;
+    this.lastSpatialTriggerByKind.monkey = -10;
+    this.lastSpatialTriggerByKind.butterfly = -10;
+    this.lastSpatialTriggerByKind.hummingbird = -10;
+  }
+
+  public playSpatialAnimalPassBy(
+    id: string,
+    kind: SpatialAnimalKind,
+    pos: Vec3Like,
+    intensity = 1.0
+  ) {
+    if (this._muted || this.pageHidden) return;
+    const ctx = this.ensureContext();
+    if (!ctx || ctx.state !== 'running') return;
+    this.ensureAmbientStarted();
+
+    const now = ctx.currentTime;
+    const cfg = SPATIAL_ANIMAL_CONFIG[kind];
+    if (now - this.lastSpatialTriggerByKind[kind] < cfg.cooldownSec) return;
+
+    // Distance cull relative to current 3D listener position
+    const dx = pos.x - this.listenerPos.x;
+    const dy = pos.y - this.listenerPos.y;
+    const dz = pos.z - this.listenerPos.z;
+    if (dx * dx + dy * dy + dz * dz > cfg.maxAudibleDist * cfg.maxAudibleDist) return;
+
+    this.lastSpatialTriggerByKind[kind] = now;
+    const vol = Math.max(0.35, Math.min(1.25, intensity));
+    const seed = this.hashStringUnit(id);
+    const pitchVar = 0.88 + seed * 0.28;
+
+    if (kind === 'parrot') {
+      const source = this.allocateSpatialSource(ctx, id, 'parrot', pos, 0.72);
+      if (!source) return;
+      this.synthesizeParrotSquawk(ctx, source.busGain, now, pitchVar, vol * 0.92, false);
+    } else if (kind === 'monkey') {
+      const source = this.allocateSpatialSource(ctx, id, 'monkey', pos, 0.82);
+      if (!source) return;
+      this.synthesizeMonkeyChatter(ctx, source.busGain, now, pitchVar, vol);
+    } else if (kind === 'butterfly') {
+      const source = this.allocateSpatialSource(ctx, id, 'butterfly', pos, 0.65);
+      if (!source) return;
+      this.synthesizeButterflyFlutter(ctx, source.busGain, now, pitchVar, vol, false);
+    } else {
+      const source = this.allocateSpatialSource(ctx, id, 'hummingbird', pos, 0.56);
+      if (!source) return;
+      this.synthesizeHummingbirdHover(ctx, source.busGain, now, pitchVar, vol);
+    }
+  }
+
+  private synthesizeParrotSquawk(
+    ctx: AudioContext,
+    dest: AudioNode,
+    now: number,
+    pitchVar: number,
+    vol: number,
+    startled: boolean
+  ) {
+    // Two-syllable formant-filtered tropical macaw / amazon parrot vocalization
+    const syllables = startled
+      ? [
+          { delay: 0, dur: 0.13, fStart: 1180, fPeak: 1840, fEnd: 1360, gain: 0.085 },
+          { delay: 0.14, dur: 0.15, fStart: 1520, fPeak: 1960, fEnd: 1120, gain: 0.075 },
+        ]
+      : [
+          { delay: 0, dur: 0.16, fStart: 980, fPeak: 1560, fEnd: 1160, gain: 0.075 },
+          { delay: 0.21, dur: 0.21, fStart: 1340, fPeak: 1620, fEnd: 920, gain: 0.068 },
+        ];
+
+    for (const s of syllables) {
+      const t0 = now + s.delay;
+      const formant = ctx.createBiquadFilter();
+      formant.type = 'bandpass';
+      formant.frequency.setValueAtTime(1750 * pitchVar, t0);
+      formant.frequency.exponentialRampToValueAtTime(1320 * pitchVar, t0 + s.dur);
+      formant.Q.setValueAtTime(2.9, t0);
+
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0.0001, t0);
+      env.gain.linearRampToValueAtTime(s.gain * vol, t0 + 0.022);
+      env.gain.exponentialRampToValueAtTime(0.0001, t0 + s.dur);
+
+      // Reedy primary harmonic + triangle warmth
+      const oscA = ctx.createOscillator();
+      oscA.type = 'sawtooth';
+      oscA.frequency.setValueAtTime(s.fStart * pitchVar, t0);
+      oscA.frequency.exponentialRampToValueAtTime(s.fPeak * pitchVar, t0 + s.dur * 0.42);
+      oscA.frequency.exponentialRampToValueAtTime(s.fEnd * pitchVar, t0 + s.dur);
+
+      const oscB = ctx.createOscillator();
+      oscB.type = 'triangle';
+      oscB.frequency.setValueAtTime(s.fStart * pitchVar * 1.49, t0);
+      oscB.frequency.exponentialRampToValueAtTime(s.fEnd * pitchVar * 1.35, t0 + s.dur);
+
+      const oscBGain = ctx.createGain();
+      oscBGain.gain.setValueAtTime(0.45, t0);
+
+      // Subtle throat raspy vibrato characteristic of parrots
+      const vib = ctx.createOscillator();
+      vib.frequency.setValueAtTime(startled ? 34 : 26, t0);
+      const vibDepth = ctx.createGain();
+      vibDepth.gain.setValueAtTime(55 * pitchVar, t0);
+      vib.connect(vibDepth);
+      vibDepth.connect(oscA.frequency);
+
+      oscA.connect(formant);
+      oscB.connect(oscBGain);
+      oscBGain.connect(formant);
+      formant.connect(env);
+      env.connect(dest);
+
+      vib.start(t0);
+      oscA.start(t0);
+      oscB.start(t0);
+      vib.stop(t0 + s.dur + 0.03);
+      oscA.stop(t0 + s.dur + 0.03);
+      oscB.stop(t0 + s.dur + 0.03);
+    }
+
+    // Wingbeats on takeoff or subtle branch-hop rustle when perched
+    const noiseBuf = this.getFootstepNoiseBuffer(ctx);
+    const beatCount = startled ? 4 : 1;
+    for (let i = 0; i < beatCount; i++) {
+      const t = now + (startled ? 0.04 + i * 0.072 : 0.08);
+      const src = ctx.createBufferSource();
+      src.buffer = noiseBuf;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime((startled ? 860 : 1280) + i * 150, t);
+      bp.Q.setValueAtTime(1.5, t);
+      const g = ctx.createGain();
+      const peak = (startled ? 0.055 : 0.022) * vol;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.linearRampToValueAtTime(peak, t + 0.015);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.068);
+      src.connect(bp);
+      bp.connect(g);
+      g.connect(dest);
+      src.start(t, Math.random() * 0.12, 0.075);
+    }
+  }
+
+  private synthesizeMonkeyChatter(
+    ctx: AudioContext,
+    dest: AudioNode,
+    now: number,
+    pitchVar: number,
+    vol: number
+  ) {
+    // Expressive canopy monkey "ooh-ooh-aah-aah!" rhythmic chatter
+    const calls = [
+      { delay: 0.0, dur: 0.11, f0: 450, f1: 780, f2: 610, gain: 0.085 },
+      { delay: 0.14, dur: 0.11, f0: 510, f1: 890, f2: 680, gain: 0.095 },
+      { delay: 0.30, dur: 0.15, f0: 660, f1: 1120, f2: 740, gain: 0.105 },
+      { delay: 0.48, dur: 0.14, f0: 620, f1: 960, f2: 520, gain: 0.082 },
+    ];
+
+    for (const c of calls) {
+      const t0 = now + c.delay;
+      const formant = ctx.createBiquadFilter();
+      formant.type = 'bandpass';
+      formant.frequency.setValueAtTime(1180 * pitchVar, t0);
+      formant.Q.setValueAtTime(2.2, t0);
+
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0.0001, t0);
+      env.gain.linearRampToValueAtTime(c.gain * vol, t0 + 0.02);
+      env.gain.exponentialRampToValueAtTime(0.0001, t0 + c.dur);
+
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(c.f0 * pitchVar, t0);
+      osc.frequency.exponentialRampToValueAtTime(c.f1 * pitchVar, t0 + c.dur * 0.45);
+      osc.frequency.exponentialRampToValueAtTime(c.f2 * pitchVar, t0 + c.dur);
+
+      const overtone = ctx.createOscillator();
+      overtone.type = 'sine';
+      overtone.frequency.setValueAtTime(c.f0 * pitchVar * 2.02, t0);
+      overtone.frequency.exponentialRampToValueAtTime(c.f1 * pitchVar * 1.95, t0 + c.dur * 0.45);
+      overtone.frequency.exponentialRampToValueAtTime(c.f2 * pitchVar * 1.85, t0 + c.dur);
+
+      const overGain = ctx.createGain();
+      overGain.gain.setValueAtTime(0.32, t0);
+
+      osc.connect(formant);
+      overtone.connect(overGain);
+      overGain.connect(formant);
+      formant.connect(env);
+      env.connect(dest);
+
+      osc.start(t0);
+      overtone.start(t0);
+      osc.stop(t0 + c.dur + 0.025);
+      overtone.stop(t0 + c.dur + 0.025);
+    }
+
+    // Light canopy leaf rustle from the tree limb
+    const noiseBuf = this.getFootstepNoiseBuffer(ctx);
+    const rustle = ctx.createBufferSource();
+    rustle.buffer = noiseBuf;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(1450, now);
+    bp.frequency.exponentialRampToValueAtTime(820, now + 0.24);
+    bp.Q.setValueAtTime(1.2, now);
+    const rg = ctx.createGain();
+    rg.gain.setValueAtTime(0.0001, now);
+    rg.gain.linearRampToValueAtTime(0.036 * vol, now + 0.04);
+    rg.gain.exponentialRampToValueAtTime(0.0001, now + 0.26);
+    rustle.connect(bp);
+    bp.connect(rg);
+    rg.connect(dest);
+    rustle.start(now, Math.random() * 0.08, 0.28);
+  }
+
+  private synthesizeButterflyFlutter(
+    ctx: AudioContext,
+    dest: AudioNode,
+    now: number,
+    pitchVar: number,
+    vol: number,
+    startled: boolean
+  ) {
+    // Delicate airy wing-flutter pulses modulated at butterfly wingbeat cadence (11–18 Hz)
+    const dur = startled ? 0.56 : 0.48;
+    const noiseBuf = this.getFootstepNoiseBuffer(ctx);
+    const src = ctx.createBufferSource();
+    src.buffer = noiseBuf;
+    src.loop = true;
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime((startled ? 2350 : 2100) * pitchVar, now);
+    bp.frequency.exponentialRampToValueAtTime((startled ? 3200 : 2650) * pitchVar, now + dur);
+    bp.Q.setValueAtTime(2.6, now);
+
+    // Amplitude-modulated wingbeat flutter
+    const modGain = ctx.createGain();
+    modGain.gain.setValueAtTime(0.55, now);
+    const wingLfo = ctx.createOscillator();
+    wingLfo.type = 'sine';
+    wingLfo.frequency.setValueAtTime((startled ? 18.5 : 12.2) * (0.9 + pitchVar * 0.15), now);
+    const wingLfoDepth = ctx.createGain();
+    wingLfoDepth.gain.setValueAtTime(0.42, now);
+    wingLfo.connect(wingLfoDepth);
+    wingLfoDepth.connect(modGain.gain);
+
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0.0001, now);
+    env.gain.linearRampToValueAtTime((startled ? 0.048 : 0.034) * vol, now + 0.055);
+    env.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+
+    src.connect(bp);
+    bp.connect(modGain);
+    modGain.connect(env);
+    env.connect(dest);
+
+    wingLfo.start(now);
+    src.start(now, Math.random() * 0.15, dur + 0.04);
+    wingLfo.stop(now + dur + 0.04);
+
+    // Soft fairy-like blossom air shimmer overtone
+    const shimmer = ctx.createOscillator();
+    shimmer.type = 'sine';
+    shimmer.frequency.setValueAtTime(2750 * pitchVar, now);
+    shimmer.frequency.exponentialRampToValueAtTime(3350 * pitchVar, now + dur * 0.7);
+    const sg = ctx.createGain();
+    sg.gain.setValueAtTime(0.0001, now);
+    sg.gain.linearRampToValueAtTime((startled ? 0.011 : 0.007) * vol, now + 0.07);
+    sg.gain.exponentialRampToValueAtTime(0.0001, now + dur * 0.85);
+    shimmer.connect(sg);
+    sg.connect(dest);
+    shimmer.start(now);
+    shimmer.stop(now + dur);
+  }
+
+  private synthesizeHummingbirdHover(
+    ctx: AudioContext,
+    dest: AudioNode,
+    now: number,
+    pitchVar: number,
+    vol: number
+  ) {
+    // Rapid 28 Hz buzzing wing-hum + high dainty double chirp
+    const dur = 0.42;
+    const noiseBuf = this.getFootstepNoiseBuffer(ctx);
+    const src = ctx.createBufferSource();
+    src.buffer = noiseBuf;
+    src.loop = true;
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(1400 * pitchVar, now);
+    bp.Q.setValueAtTime(2.2, now);
+
+    const buzzMod = ctx.createGain();
+    buzzMod.gain.setValueAtTime(0.55, now);
+    const lfo = ctx.createOscillator();
+    lfo.frequency.setValueAtTime(28, now);
+    const lfoDepth = ctx.createGain();
+    lfoDepth.gain.setValueAtTime(0.42, now);
+    lfo.connect(lfoDepth);
+    lfoDepth.connect(buzzMod.gain);
+
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0.0001, now);
+    env.gain.linearRampToValueAtTime(0.036 * vol, now + 0.04);
+    env.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+
+    src.connect(bp);
+    bp.connect(buzzMod);
+    buzzMod.connect(env);
+    env.connect(dest);
+
+    lfo.start(now);
+    src.start(now, Math.random() * 0.1, dur + 0.03);
+    lfo.stop(now + dur + 0.03);
+
+    // High crystalline twin chirp
+    [
+      { d: 0.02, f0: 2680, f1: 3320 },
+      { d: 0.1, f0: 3180, f1: 2560 },
+    ].forEach((n) => {
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(n.f0 * pitchVar, now + n.d);
+      osc.frequency.exponentialRampToValueAtTime(n.f1 * pitchVar, now + n.d + 0.065);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, now + n.d);
+      g.gain.linearRampToValueAtTime(0.028 * vol, now + n.d + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + n.d + 0.07);
+      osc.connect(g);
+      g.connect(dest);
+      osc.start(now + n.d);
+      osc.stop(now + n.d + 0.08);
+    });
+  }
+
+  monkeyChirp(pos?: Vec3Like, sourceId?: string) {
+    if (this._muted || this.pageHidden) return;
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    this.ensureAmbientStarted();
+
+    if (pos) {
+      const now = ctx.currentTime;
+      const id = sourceId ?? `monkey_chirp_${Math.round(pos.z * 10)}`;
+      const source = this.allocateSpatialSource(ctx, id, 'monkey', pos, 0.34);
+      if (!source) return;
+      const pitchVar = 0.92 + this.hashStringUnit(id) * 0.2;
+      const notes = [
+        { delay: 0, f0: 540, f1: 920, dur: 0.09, peak: 0.11 },
+        { delay: 0.095, f0: 820, f1: 490, dur: 0.11, peak: 0.095 },
+      ];
+      for (const n of notes) {
+        const t0 = now + n.delay;
+        const osc = ctx.createOscillator();
+        const g = ctx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(n.f0 * pitchVar, t0);
+        osc.frequency.exponentialRampToValueAtTime(n.f1 * pitchVar, t0 + n.dur);
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.linearRampToValueAtTime(n.peak, t0 + 0.014);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + n.dur);
+        osc.connect(g);
+        g.connect(source.busGain);
+        osc.start(t0);
+        osc.stop(t0 + n.dur + 0.02);
+      }
+      return;
+    }
+
     this.tone(540, 880, 0.08, 'sine', 0.1, 0);
     this.tone(760, 480, 0.09, 'sine', 0.09, 0.085);
   }
 
-  wildlifeScatter(kind: 'parrot' | 'butterfly' | 'hummingbird') {
+  wildlifeScatter(
+    kind: 'parrot' | 'butterfly' | 'hummingbird',
+    pos?: Vec3Like,
+    sourceId?: string
+  ) {
+    if (this._muted || this.pageHidden) return;
     const ctx = this.ensureContext();
     if (!ctx) return;
+    this.ensureAmbientStarted();
     const now = ctx.currentTime;
-    if (now - this.lastWildlifeScatterAt < 0.35) return;
+    if (now - this.lastWildlifeScatterAt < 0.24) return;
     this.lastWildlifeScatterAt = now;
+
+    if (pos) {
+      const id = sourceId ?? `scatter_${kind}_${Math.round(pos.z * 10)}`;
+      const pitchVar = 0.9 + this.hashStringUnit(id) * 0.24;
+      if (kind === 'parrot') {
+        const source = this.allocateSpatialSource(ctx, id, 'parrot', pos, 0.62);
+        if (source) {
+          this.synthesizeParrotSquawk(ctx, source.busGain, now, pitchVar, 1.05, true);
+        }
+      } else if (kind === 'hummingbird') {
+        const source = this.allocateSpatialSource(ctx, id, 'hummingbird', pos, 0.46);
+        if (source) {
+          this.synthesizeHummingbirdHover(ctx, source.busGain, now, pitchVar * 1.06, 1.0);
+        }
+      } else {
+        const source = this.allocateSpatialSource(ctx, id, 'butterfly', pos, 0.62);
+        if (source) {
+          this.synthesizeButterflyFlutter(ctx, source.busGain, now, pitchVar, 1.05, true);
+        }
+      }
+      return;
+    }
 
     if (kind === 'parrot') {
       // Soft startled tropical double-squawk + gentle wing-flutter puff
@@ -986,6 +1667,385 @@ class SoundEngine {
       tick.start(now);
       tick.stop(now + 0.04);
     }
+  }
+
+  public laneSwitch() {
+    if (this._muted) return;
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const noiseBuf = this.getFootstepNoiseBuffer(ctx);
+
+    const src = ctx.createBufferSource();
+    src.buffer = noiseBuf;
+    src.playbackRate.setValueAtTime(1.15, now);
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(520, now);
+    bp.frequency.exponentialRampToValueAtTime(1350, now + 0.09);
+    bp.Q.setValueAtTime(1.6, now);
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.linearRampToValueAtTime(0.055, now + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.11);
+
+    src.connect(bp);
+    bp.connect(g);
+    g.connect(ctx.destination);
+    src.start(now, Math.random() * 0.1, 0.12);
+  }
+
+  public slide(terrain: TerrainType = 'dirt') {
+    if (this._muted) return;
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const noiseBuf = this.getFootstepNoiseBuffer(ctx);
+
+    const src = ctx.createBufferSource();
+    src.buffer = noiseBuf;
+    src.loop = true;
+    src.playbackRate.setValueAtTime(terrain === 'ice' ? 1.55 : terrain === 'stone' ? 1.2 : 0.88, now);
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(terrain === 'ice' ? 2400 : 1080, now);
+    bp.frequency.exponentialRampToValueAtTime(terrain === 'ice' ? 1300 : 420, now + 0.34);
+    bp.Q.setValueAtTime(1.1, now);
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.linearRampToValueAtTime(0.095, now + 0.035);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.38);
+
+    src.connect(bp);
+    bp.connect(g);
+    g.connect(ctx.destination);
+    src.start(now, Math.random() * 0.15, 0.4);
+  }
+
+  public waterSplash() {
+    if (this._muted) return;
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const noiseBuf = this.getFootstepNoiseBuffer(ctx);
+
+    // Sparkling water burst whoosh
+    const src = ctx.createBufferSource();
+    src.buffer = noiseBuf;
+    src.loop = true;
+    src.playbackRate.setValueAtTime(1.15, now);
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(1450, now);
+    bp.frequency.exponentialRampToValueAtTime(420, now + 0.42);
+    bp.Q.setValueAtTime(0.85, now);
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.linearRampToValueAtTime(0.18, now + 0.025);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.44);
+
+    src.connect(bp);
+    bp.connect(g);
+    g.connect(ctx.destination);
+    src.start(now, 0, 0.46);
+
+    // Three bright rising water-droplet blips
+    [0.02, 0.09, 0.17].forEach((offset, idx) => {
+      const osc = ctx.createOscillator();
+      const og = ctx.createGain();
+      osc.type = 'sine';
+      const baseF = 520 + idx * 185;
+      osc.frequency.setValueAtTime(baseF, now + offset);
+      osc.frequency.exponentialRampToValueAtTime(baseF * 1.65, now + offset + 0.09);
+      og.gain.setValueAtTime(0.0001, now + offset);
+      og.gain.linearRampToValueAtTime(0.085, now + offset + 0.015);
+      og.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.11);
+      osc.connect(og);
+      og.connect(ctx.destination);
+      osc.start(now + offset);
+      osc.stop(now + offset + 0.12);
+    });
+  }
+
+  public blueButtonPress() {
+    if (this._muted) return;
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+
+    // Tactile mechanical click thump
+    const clickOsc = ctx.createOscillator();
+    const clickGain = ctx.createGain();
+    clickOsc.type = 'triangle';
+    clickOsc.frequency.setValueAtTime(240, now);
+    clickOsc.frequency.exponentialRampToValueAtTime(82, now + 0.065);
+    clickGain.gain.setValueAtTime(0.0001, now);
+    clickGain.gain.linearRampToValueAtTime(0.24, now + 0.006);
+    clickGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.075);
+    clickOsc.connect(clickGain);
+    clickGain.connect(ctx.destination);
+    clickOsc.start(now);
+    clickOsc.stop(now + 0.085);
+
+    // Bright resonant blue-button activation chime triad
+    [
+      { delay: 0.025, f: 587.33, dur: 0.16, peak: 0.11 },
+      { delay: 0.09, f: 880.0, dur: 0.18, peak: 0.12 },
+      { delay: 0.155, f: 1174.66, dur: 0.24, peak: 0.1 },
+    ].forEach((n) => {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(n.f, now + n.delay);
+      g.gain.setValueAtTime(0.0001, now + n.delay);
+      g.gain.linearRampToValueAtTime(n.peak, now + n.delay + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + n.delay + n.dur);
+      osc.connect(g);
+      g.connect(ctx.destination);
+      osc.start(now + n.delay);
+      osc.stop(now + n.delay + n.dur + 0.02);
+    });
+  }
+
+  public langoorChirp() {
+    if (this._muted) return;
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+
+    // Playful friendly Gray Langur double-whoop greeting ("hoo-oop!")
+    const notes = [
+      { delay: 0.04, f0: 540, f1: 920, dur: 0.11 },
+      { delay: 0.17, f0: 660, f1: 1180, dur: 0.14 },
+    ];
+    for (const n of notes) {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(n.f0, now + n.delay);
+      osc.frequency.exponentialRampToValueAtTime(n.f1, now + n.delay + n.dur * 0.72);
+      osc.frequency.exponentialRampToValueAtTime(n.f1 * 0.88, now + n.delay + n.dur);
+      g.gain.setValueAtTime(0.0001, now + n.delay);
+      g.gain.linearRampToValueAtTime(0.11, now + n.delay + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + n.delay + n.dur + 0.02);
+      osc.connect(g);
+      g.connect(ctx.destination);
+      osc.start(now + n.delay);
+      osc.stop(now + n.delay + n.dur + 0.03);
+    }
+  }
+
+  public extraLife() {
+    if (this._muted) return;
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+
+    // Classic bright ascending 1-UP extra-life arpeggio chime
+    const notes = [659.25, 783.99, 1318.51, 1046.5, 1174.66, 1567.98];
+    notes.forEach((freq, idx) => {
+      const delay = idx * 0.068;
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(freq, now + delay);
+      g.gain.setValueAtTime(0.0001, now + delay);
+      g.gain.linearRampToValueAtTime(0.13, now + delay + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + delay + 0.16);
+      osc.connect(g);
+      g.connect(ctx.destination);
+      osc.start(now + delay);
+      osc.stop(now + delay + 0.18);
+    });
+  }
+
+  public surpriseAnimalCall(speciesIndex: number) {
+    if (this._muted) return;
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+
+    // Bright playful discovery sparkle chime
+    [
+      { d: 0, f: 659.25 },
+      { d: 0.08, f: 880 },
+      { d: 0.16, f: 1174.66 },
+    ].forEach((n) => {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(n.f, now + n.d);
+      g.gain.setValueAtTime(0.0001, now + n.d);
+      g.gain.linearRampToValueAtTime(0.06, now + n.d + 0.015);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + n.d + 0.18);
+      osc.connect(g);
+      g.connect(ctx.destination);
+      osc.start(now + n.d);
+      osc.stop(now + n.d + 0.2);
+    });
+
+    const idx = ((speciesIndex % 10) + 10) % 10;
+    if (idx === 1) {
+      // Cheerful baby elephant trumpet!
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = 'sawtooth';
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'bandpass';
+      lp.frequency.setValueAtTime(640, now + 0.08);
+      lp.Q.setValueAtTime(2.5, now + 0.08);
+      osc.frequency.setValueAtTime(290, now + 0.08);
+      osc.frequency.exponentialRampToValueAtTime(620, now + 0.28);
+      osc.frequency.exponentialRampToValueAtTime(480, now + 0.56);
+      g.gain.setValueAtTime(0.0001, now + 0.08);
+      g.gain.linearRampToValueAtTime(0.11, now + 0.14);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.58);
+      osc.connect(lp);
+      lp.connect(g);
+      g.connect(ctx.destination);
+      osc.start(now + 0.08);
+      osc.stop(now + 0.6);
+    } else if (idx === 0 || idx === 9 || idx === 8) {
+      // Friendly warm big-cat / bear rumble purr
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = 'sawtooth';
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(340, now + 0.06);
+      osc.frequency.setValueAtTime(145, now + 0.06);
+      osc.frequency.exponentialRampToValueAtTime(86, now + 0.48);
+      g.gain.setValueAtTime(0.0001, now + 0.06);
+      g.gain.linearRampToValueAtTime(0.12, now + 0.14);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.52);
+      osc.connect(lp);
+      lp.connect(g);
+      g.connect(ctx.destination);
+      osc.start(now + 0.06);
+      osc.stop(now + 0.55);
+    } else if (idx === 2 || idx === 7) {
+      // Bright peacock / toucan melodic call
+      [0.08, 0.25].forEach((delay, k) => {
+        const osc = ctx.createOscillator();
+        const g = ctx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(k === 0 ? 920 : 1080, now + delay);
+        osc.frequency.exponentialRampToValueAtTime(k === 0 ? 1560 : 760, now + delay + 0.16);
+        g.gain.setValueAtTime(0.0001, now + delay);
+        g.gain.linearRampToValueAtTime(0.095, now + delay + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + delay + 0.19);
+        osc.connect(g);
+        g.connect(ctx.destination);
+        osc.start(now + delay);
+        osc.stop(now + delay + 0.21);
+      });
+    } else if (idx === 6) {
+      // Playful croc water breach splash
+      this.waterSplash();
+    } else {
+      // Lighthearted woodland deer / fox / panda playful double-chirp
+      [0.08, 0.2].forEach((delay, k) => {
+        const osc = ctx.createOscillator();
+        const g = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(k === 0 ? 740 : 960, now + delay);
+        osc.frequency.exponentialRampToValueAtTime(k === 0 ? 1120 : 1340, now + delay + 0.11);
+        g.gain.setValueAtTime(0.0001, now + delay);
+        g.gain.linearRampToValueAtTime(0.09, now + delay + 0.015);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + delay + 0.13);
+        osc.connect(g);
+        g.connect(ctx.destination);
+        osc.start(now + delay);
+        osc.stop(now + delay + 0.14);
+      });
+    }
+  }
+
+  public vineGrab() {
+    if (this._muted) return;
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const noiseBuf = this.getFootstepNoiseBuffer(ctx);
+
+    // Leafy rope catch rustle
+    const src = ctx.createBufferSource();
+    src.buffer = noiseBuf;
+    src.playbackRate.setValueAtTime(1.25, now);
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(1650, now);
+    bp.frequency.exponentialRampToValueAtTime(640, now + 0.18);
+    bp.Q.setValueAtTime(1.4, now);
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(0.0001, now);
+    ng.gain.linearRampToValueAtTime(0.16, now + 0.015);
+    ng.gain.exponentialRampToValueAtTime(0.0001, now + 0.2);
+    src.connect(bp);
+    bp.connect(ng);
+    ng.connect(ctx.destination);
+    src.start(now, 0, 0.22);
+
+    // Taut vine creak thump
+    const osc = ctx.createOscillator();
+    const og = ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(220, now);
+    osc.frequency.exponentialRampToValueAtTime(340, now + 0.09);
+    og.gain.setValueAtTime(0.0001, now);
+    og.gain.linearRampToValueAtTime(0.14, now + 0.012);
+    og.gain.exponentialRampToValueAtTime(0.0001, now + 0.13);
+    osc.connect(og);
+    og.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.14);
+  }
+
+  public vineRelease() {
+    if (this._muted) return;
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const noiseBuf = this.getFootstepNoiseBuffer(ctx);
+
+    // Airy Tarzan-style swing release whoosh
+    const src = ctx.createBufferSource();
+    src.buffer = noiseBuf;
+    src.loop = true;
+    src.playbackRate.setValueAtTime(1.1, now);
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(480, now);
+    bp.frequency.exponentialRampToValueAtTime(1850, now + 0.22);
+    bp.Q.setValueAtTime(1.2, now);
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(0.0001, now);
+    ng.gain.linearRampToValueAtTime(0.15, now + 0.04);
+    ng.gain.exponentialRampToValueAtTime(0.0001, now + 0.26);
+    src.connect(bp);
+    bp.connect(ng);
+    ng.connect(ctx.destination);
+    src.start(now, 0, 0.28);
+
+    // Bright upward launch chime
+    const osc = ctx.createOscillator();
+    const og = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(330, now);
+    osc.frequency.exponentialRampToValueAtTime(760, now + 0.18);
+    og.gain.setValueAtTime(0.0001, now);
+    og.gain.linearRampToValueAtTime(0.11, now + 0.02);
+    og.gain.exponentialRampToValueAtTime(0.0001, now + 0.21);
+    osc.connect(og);
+    og.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.22);
   }
 }
 

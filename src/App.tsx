@@ -18,6 +18,7 @@ import {
   totalClaimableMissionCoins,
 } from './data/dailyMissions';
 import { getLevelSpec } from './data/levels';
+import { getFestivalForLevel } from './engine/festivalSystem';
 import {
   JungleGameCanvas,
   TouchInputBridge,
@@ -28,11 +29,25 @@ import {
   DailyMissionSpec,
   GamePhase,
   Gender,
+  GraphicsQuality,
   LevelClearSummary,
   LiveHudState,
   SaveData,
   WeatherMode,
 } from './types/game';
+
+function detectDefaultGraphicsQuality(): GraphicsQuality {
+  if (typeof navigator === 'undefined') return 'high';
+  const cores = navigator.hardwareConcurrency ?? 8;
+  const isMobile = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+  if (isMobile && cores <= 4) return 'medium';
+  return 'high';
+}
+
+function normalizeGraphicsQuality(val: unknown): GraphicsQuality {
+  if (val === 'low' || val === 'medium' || val === 'high') return val;
+  return detectDefaultGraphicsQuality();
+}
 
 const STORAGE_KEY = 'jungle_quest_3d_save_v3';
 const PREV_STORAGE_KEY = 'jungle_quest_3d_save_v2';
@@ -95,6 +110,8 @@ function loadSaveData(): SaveData {
           parsed.weatherMode === 'clear'
             ? parsed.weatherMode
             : 'auto',
+        graphicsQuality: normalizeGraphicsQuality(parsed.graphicsQuality),
+        festivalMode: Boolean(parsed.festivalMode),
         dailyMissions: syncDailyMissionState(parsed.dailyMissions),
       };
     }
@@ -128,6 +145,8 @@ function loadSaveData(): SaveData {
         autoRun: Boolean(parsed.autoRun),
         muted: Boolean(parsed.muted),
         weatherMode: 'auto',
+        graphicsQuality: detectDefaultGraphicsQuality(),
+        festivalMode: false,
         dailyMissions: syncDailyMissionState(parsed.dailyMissions),
       };
     }
@@ -145,6 +164,8 @@ function loadSaveData(): SaveData {
     autoRun: false,
     muted: false,
     weatherMode: 'auto',
+    graphicsQuality: detectDefaultGraphicsQuality(),
+    festivalMode: false,
     dailyMissions: syncDailyMissionState(undefined),
   };
 }
@@ -181,6 +202,10 @@ export default function App() {
   const [phase, setPhase] = useState<GamePhase>('menu');
   const [returnPhase, setReturnPhase] = useState<GamePhase>('menu');
   const [summary, setSummary] = useState<LevelClearSummary | null>(null);
+  const [gameOverSummary, setGameOverSummary] = useState<{
+    coinsEarned: number;
+    points: number;
+  } | null>(null);
 
   const initialSpec = getLevelSpec(currentLevel);
   const [hud, setHud] = useState<LiveHudState>({
@@ -197,6 +222,8 @@ export default function App() {
     powerUpRemaining: 0,
     stompCombo: 0,
     weather: 'clear',
+    festivalId: save.festivalMode ? getFestivalForLevel(initialSpec.levelNumber).id : null,
+    festivalName: save.festivalMode ? getFestivalForLevel(initialSpec.levelNumber).name : null,
   });
 
   const touchBridgeRef = useRef<TouchInputBridge>({
@@ -207,6 +234,8 @@ export default function App() {
     sprint: false,
     jumpPressed: false,
     jumpHeld: false,
+    laneLeftPressed: false,
+    laneRightPressed: false,
     firePressed: false,
   });
 
@@ -255,9 +284,11 @@ export default function App() {
   const startLevel = useCallback((lvl: number) => {
     const clamped = Math.max(1, Math.min(40, lvl));
     const spec = getLevelSpec(clamped);
+    const fest = getFestivalForLevel(clamped);
     setCurrentLevel(clamped);
     setRunNonce((n) => n + 1);
     setSummary(null);
+    setGameOverSummary(null);
     setHud({
       level: spec.levelNumber,
       levelName: spec.name,
@@ -272,9 +303,15 @@ export default function App() {
       powerUpRemaining: 0,
       stompCombo: 0,
       weather: spec.biome === 'waterfall' ? 'mist' : 'clear',
+      hasLangoorPet: false,
+      onVine: false,
+      surpriseAnimalName: null,
+      extraLifeBanner: false,
+      festivalId: save.festivalMode ? fest.id : null,
+      festivalName: save.festivalMode ? fest.name : null,
     });
     setPhase('playing');
-  }, []);
+  }, [save.festivalMode]);
 
   const handleSessionCoinsChange = useCallback((delta: number) => {
     setSave((prev) => ({
@@ -429,9 +466,15 @@ export default function App() {
     });
   }, [currentLevel]);
 
-  const handleGameOver = useCallback(() => {
-    setPhase('gameOver');
-  }, []);
+  const handleGameOver = useCallback(
+    (sessionCoins: number, progress: number) => {
+      const distancePoints = Math.round(progress * (80 + currentLevel * 35));
+      const points = distancePoints + sessionCoins * 25;
+      setGameOverSummary({ coinsEarned: sessionCoins, points });
+      setPhase('gameOver');
+    },
+    [currentLevel]
+  );
 
   const openModal = (target: 'wardrobe' | 'levels' | 'missions') => {
     if (phase === 'playing') {
@@ -536,6 +579,28 @@ export default function App() {
   const claimableMissionCoins = totalClaimableMissionCoins(dailyMissionState, dailyMissionSpecs);
 
   const currentWeatherMode: WeatherMode = save.weatherMode ?? 'auto';
+  const currentGraphicsQuality: GraphicsQuality = save.graphicsQuality ?? 'high';
+  const isFestivalMode = Boolean(save.festivalMode);
+
+  const handleSetFestivalMode = useCallback(
+    (enabled: boolean) => {
+      if (enabled) soundEngine.mysteryBlock();
+      else soundEngine.equip();
+      setSave((prev) => ({ ...prev, festivalMode: enabled }));
+      const fest = getFestivalForLevel(currentLevel);
+      setHud((h) => ({
+        ...h,
+        festivalId: enabled ? fest.id : null,
+        festivalName: enabled ? fest.name : null,
+      }));
+    },
+    [currentLevel]
+  );
+
+  const handleToggleFestivalMode = useCallback(() => {
+    handleSetFestivalMode(!isFestivalMode);
+  }, [handleSetFestivalMode, isFestivalMode]);
+
   const handleCycleWeatherMode = useCallback(() => {
     const weatherOrder: WeatherMode[] = ['auto', 'rain', 'mist', 'clear'];
     const next = weatherOrder[(weatherOrder.indexOf(currentWeatherMode) + 1) % weatherOrder.length];
@@ -545,8 +610,22 @@ export default function App() {
     }
   }, [currentWeatherMode]);
 
+  const handleSetGraphicsQuality = useCallback((quality: GraphicsQuality) => {
+    setSave((prev) => ({ ...prev, graphicsQuality: quality }));
+  }, []);
+
+  const handleCycleGraphicsQuality = useCallback(() => {
+    const order: GraphicsQuality[] = ['low', 'medium', 'high'];
+    const next = order[(order.indexOf(currentGraphicsQuality) + 1) % order.length];
+    setSave((prev) => ({ ...prev, graphicsQuality: next }));
+  }, [currentGraphicsQuality]);
+
   return (
-    <div className="relative h-dvh w-screen overflow-hidden bg-[#081a14]">
+    <div
+      className={`relative h-dvh w-screen overflow-hidden bg-[#081a14] ${
+        currentGraphicsQuality === 'low' ? 'low-gfx' : ''
+      }`}
+    >
       {/* Full-Bleed 3D WebGL + Cannon-ES Physics Jungle Canvas */}
       <JungleGameCanvas
         levelNumber={currentLevel}
@@ -555,6 +634,8 @@ export default function App() {
         customization={save.equipped}
         autoRun={save.autoRun}
         weatherMode={currentWeatherMode}
+        graphicsQuality={currentGraphicsQuality}
+        festivalMode={isFestivalMode}
         touchBridgeRef={touchBridgeRef}
         onHudUpdate={setHud}
         onSessionCoinsChange={handleSessionCoinsChange}
@@ -573,12 +654,16 @@ export default function App() {
         autoRun={save.autoRun}
         muted={save.muted}
         weatherMode={currentWeatherMode}
+        graphicsQuality={currentGraphicsQuality}
+        festivalMode={isFestivalMode}
         claimableMissionsCount={claimableMissionsCount}
         touchBridgeRef={touchBridgeRef}
         onToggleAutoRun={() =>
           setSave((prev) => ({ ...prev, autoRun: !prev.autoRun }))
         }
         onCycleWeatherMode={handleCycleWeatherMode}
+        onCycleGraphicsQuality={handleCycleGraphicsQuality}
+        onToggleFestivalMode={handleToggleFestivalMode}
         onToggleMute={() =>
           setSave((prev) => {
             const nextMuted = !prev.muted;
@@ -598,15 +683,21 @@ export default function App() {
       {/* Menu / Pause / Level Complete / Game Over / Victory */}
       <GameOverlays
         phase={phase}
+        runNonce={runNonce}
         currentLevel={currentLevel}
         highestUnlockedLevel={save.highestUnlockedLevel}
         totalCoins={save.coins}
+        graphicsQuality={currentGraphicsQuality}
+        festivalMode={isFestivalMode}
         claimableMissionsCount={claimableMissionsCount}
         claimableMissionCoins={claimableMissionCoins}
         summary={summary}
+        gameOverSummary={gameOverSummary}
         onStartLevel={startLevel}
         onResume={() => setPhase('playing')}
         onRetry={() => startLevel(currentLevel)}
+        onChangeGraphicsQuality={handleSetGraphicsQuality}
+        onChangeFestivalMode={handleSetFestivalMode}
         onOpenWardrobe={() => openModal('wardrobe')}
         onOpenLevels={() => openModal('levels')}
         onOpenMissions={() => openModal('missions')}
@@ -634,6 +725,7 @@ export default function App() {
           highestUnlocked={save.highestUnlockedLevel}
           levelStars={save.levelStars}
           levelTopTimes={save.levelTopTimes}
+          festivalMode={isFestivalMode}
           onSelectLevel={(lvl) => startLevel(lvl)}
           onClose={closeModal}
         />
